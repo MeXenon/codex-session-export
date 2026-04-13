@@ -636,7 +636,7 @@ class SessionParser:
 
     # --- markdown rendering with filter ---
     def to_markdown(self, section_filter: Optional[Dict[str, bool]] = None,
-                    clean_content: bool = False, output_cap: int = 0) -> str:
+                    clean_content: bool = False, output_cap: int = 0, msg_cap: int = 0) -> str:
         if section_filter is None:
             section_filter = {s[0]: True for s in SECTION_DEFS}
 
@@ -649,6 +649,15 @@ class SessionParser:
                 return text
             kept = lines[-output_cap:]
             return f'... ({len(lines) - output_cap} lines trimmed) ...\n' + '\n'.join(kept)
+
+        keep_indices = set(range(len(self.data)))
+        if msg_cap > 0:
+            chat_msg_count = 0
+            for i in range(len(self.data) - 1, -1, -1):
+                if self.data[i]['type'] in {'user_message', 'agent_message', 'agent_reasoning', 'reasoning'}:
+                    if chat_msg_count >= msg_cap:
+                        keep_indices.remove(i)
+                    chat_msg_count += 1
 
         md: List[str] = []
         md.append(f"# {self.title}\n")
@@ -664,7 +673,8 @@ class SessionParser:
                 md.append(f"CWD: {self.metadata['cwd']}")
             md.append("```\n")
 
-        for item in self.data:
+        for i, item in enumerate(self.data):
+            if i not in keep_indices: continue
             itype = item['type']
             if not section_filter.get(itype, False):
                 continue
@@ -782,66 +792,96 @@ def read_key() -> str:
 # ──────────────────────────────────────────────────────────────
 
 # Output sections whose blocks can be capped
-OUTPUT_SECTIONS = {'terminal_output', 'mcp_tool_output', 'other_tool_output',
-                   'custom_tool_output'}
+OUTPUT_SECTIONS = {'terminal_output', 'mcp_tool_output', 'other_tool_output', 'custom_tool_output'}
 # Cap steps for ◀ ▶ control  (0 = no cap, show all)
 CAP_STEPS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30, 50, 100, 200, 500]
+MSG_CAP_STEPS = [0, 5, 10, 20, 50] + list(range(70, 511, 20))
 
-def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], bool, int]:
+def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], bool, int, int]:
     """
     Full-screen interactive filter.
-    Returns (section_filter, clean_content, output_cap).
+    Returns (section_filter, clean_content, output_cap, msg_cap).
     """
-    # ── Pre-compute data ──
-    agg_lines: Dict[str, int] = {}
-    for parser in parsers:
-        for key, count in parser.count_lines_by_section().items():
-            agg_lines[key] = agg_lines.get(key, 0) + count
+    _line_cache = {}
+    
+    def get_lines_for_state(cap_out: int, cap_msg: int, cc: bool) -> Dict[str, int]:
+        cache_key = (cap_out, cap_msg, cc)
+        if cache_key in _line_cache:
+            return _line_cache[cache_key]
+        
+        counts = {s[0]: 0 for s in SECTION_DEFS}
+        tool_call_types = {'terminal_cmd', 'mcp_tool', 'other_tool'}
+        tool_output_types = {'terminal_output', 'mcp_tool_output', 'other_tool_output'}
+        
+        for parser in parsers:
+            keep_indices = set(range(len(parser.data)))
+            if cap_msg > 0:
+                chat_msg_count = 0
+                for i in range(len(parser.data) - 1, -1, -1):
+                    if parser.data[i]['type'] in {'user_message', 'agent_message', 'agent_reasoning', 'reasoning'}:
+                        if chat_msg_count >= cap_msg:
+                            keep_indices.remove(i)
+                        chat_msg_count += 1
+            
+            for i, item in enumerate(parser.data):
+                if i not in keep_indices: continue
+                itype = item['type']
+                content = item.get('content', '')
+                
+                if itype == 'user_message':
+                    if cc: content = trim_chat_content(content)
+                    lines = content.count('\n') + 4 if content else 0
+                elif itype == 'agent_message':
+                    if cc: content = trim_chat_content(content)
+                    lines = content.count('\n') + 4 if content else 0
+                elif itype in ('agent_reasoning', 'reasoning'):
+                    lines = 2 if not content else content.count('\n') + 3
+                elif itype in tool_call_types:
+                    args = item.get('arguments', '')
+                    lines = args.count('\n') + 5
+                elif itype in tool_output_types:
+                    out = item.get('output', '')
+                    total_out = out.count('\n') + 1 if out.strip() else 0
+                    if cap_out > 0: lines = min(total_out, cap_out) + 4 if total_out > 0 else 0
+                    else: lines = total_out + 4 if total_out > 0 else 0
+                elif itype == 'custom_tool_call':
+                    lines = content.count('\n') + 5
+                elif itype == 'custom_tool_output':
+                    total_out = content.count('\n') + 1 if content.strip() else 0
+                    if cap_out > 0: lines = min(total_out, cap_out) + 4 if total_out > 0 else 0
+                    else: lines = total_out + 4 if total_out > 0 else 0
+                elif itype in ('web_search', 'token_count', 'turn_context', 'task_event', 'git_snapshot', 'session_event'):
+                    lines = 2
+                elif itype == 'system_message':
+                    lines = content.count('\n') + 5
+                else:
+                    lines = 1
+                    
+                counts[itype] = counts.get(itype, 0) + lines
+                
+            if parser.metadata:
+                counts['session_meta'] = counts.get('session_meta', 0) + 5
+                
+        _line_cache[cache_key] = counts
+        return counts
 
-    # Per-output-block content line counts (for cap estimation)
-    output_blocks: Dict[str, List[int]] = {}
-    for parser in parsers:
-        for item in parser.data:
-            itype = item['type']
-            if itype in OUTPUT_SECTIONS:
-                text = item.get('output', item.get('content', ''))
-                if text.strip():
-                    output_blocks.setdefault(itype, []).append(text.count('\n') + 1)
-
-    # Lines affected by clean chat (user + agent messages)
-    chat_lines = agg_lines.get('user_message', 0) + agg_lines.get('agent_message', 0)
-
-    def capped_lines_for(section_key: str, cap: int) -> int:
-        """Compute output section lines with a cap applied."""
-        if cap == 0:
-            return agg_lines.get(section_key, 0)
-        blocks = output_blocks.get(section_key, [])
-        return sum(min(cl, cap) + 4 for cl in blocks)
-
-    def effective_lines(section_key: str) -> int:
-        """Line count for a section, respecting current output_cap."""
-        if section_key in OUTPUT_SECTIONS and output_cap > 0:
-            return capped_lines_for(section_key, output_cap)
-        return agg_lines.get(section_key, 0)
-
-    # ── State ──
     fstate: Dict[str, bool] = {s[0]: s[3] for s in SECTION_DEFS}
     clean_content = False
-    output_cap = 8  # default: 8 lines per output block
+    output_cap = 8
     cap_idx = CAP_STEPS.index(8)
+    msg_cap = 0
+    msg_idx = MSG_CAP_STEPS.index(0)
 
     cursor = 0
-    # Rows: sections + clean_chat + output_cap
     ROW_CLEAN = len(SECTION_DEFS)
     ROW_CAP   = len(SECTION_DEFS) + 1
-    num_items = len(SECTION_DEFS) + 2
+    ROW_MSG   = len(SECTION_DEFS) + 2
+    num_items = len(SECTION_DEFS) + 3
 
     while True:
-        # ── Compute totals ──
-        total_lines = sum(effective_lines(s[0]) for s in SECTION_DEFS)
-        selected_lines = sum(
-            effective_lines(s[0]) for s in SECTION_DEFS if fstate.get(s[0], False)
-        )
+        agg_lines = get_lines_for_state(output_cap, msg_cap, clean_content)
+        total_lines = sum(agg_lines.get(s[0], 0) for s in SECTION_DEFS)
+        selected_lines = sum(agg_lines.get(s[0], 0) for s in SECTION_DEFS if fstate.get(s[0], False))
         pct = (selected_lines / total_lines * 100) if total_lines > 0 else 0
 
         # ── Render ──
@@ -853,40 +893,18 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
         for i, (key, name, emoji, _default) in enumerate(SECTION_DEFS):
             is_cursor = (i == cursor)
             is_on     = fstate.get(key, False)
-            lines     = effective_lines(key)
-            full      = agg_lines.get(key, 0)
-
+            lines     = agg_lines.get(key, 0)
+            
             arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if is_cursor else ' '
+            toggle = f'{Style.GREEN}██{Style.RESET}' if is_on else f'{Style.DIM}░░{Style.RESET}'
+            
+            if is_cursor and is_on: nstyle = f'{Style.BOLD}{Style.GREEN}'
+            elif is_cursor and not is_on: nstyle = f'{Style.BOLD}{Style.RED}'
+            elif is_on: nstyle = ''
+            else: nstyle = Style.DIM
 
-            if is_on:
-                toggle = f'{Style.GREEN}██{Style.RESET}'
-            else:
-                toggle = f'{Style.DIM}░░{Style.RESET}'
-
-            if is_cursor and is_on:
-                nstyle = f'{Style.BOLD}{Style.GREEN}'
-            elif is_cursor and not is_on:
-                nstyle = f'{Style.BOLD}{Style.RED}'
-            elif is_on:
-                nstyle = ''
-            else:
-                nstyle = Style.DIM
-
-            # Line count — show capped vs full if cap is active
-            if key in OUTPUT_SECTIONS and output_cap > 0 and full != lines:
-                if lines == 0:
-                    count_str = f'{Style.DIM}     0{Style.RESET}'
-                elif is_on:
-                    count_str = f'{Style.CYAN}{lines:>6,}{Style.RESET}{Style.DIM}↓{full:,}{Style.RESET}'
-                else:
-                    count_str = f'{Style.DIM}{lines:>6,}↓{full:,}{Style.RESET}'
-            else:
-                if lines == 0:
-                    count_str = f'{Style.DIM}     0{Style.RESET}'
-                elif is_on:
-                    count_str = f'{Style.CYAN}{lines:>6,}{Style.RESET}'
-                else:
-                    count_str = f'{Style.DIM}{lines:>6,}{Style.RESET}'
+            count_str = f'{Style.CYAN}{lines:>6,}{Style.RESET}' if is_on and lines > 0 else f'{Style.DIM}{lines:>6,}{Style.RESET}'
+            if lines == 0: count_str = f'{Style.DIM}     0{Style.RESET}'
 
             visible_name = f'{emoji} {name}'
             pad_len = max(1, 44 - len(visible_name))
@@ -894,7 +912,6 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
 
             print(f'  {arrow} {toggle} {nstyle}{visible_name}{Style.RESET} {dots} {count_str}')
 
-        # ── Settings rows ──
         print(f'  {Style.DIM}{"─" * 62}{Style.RESET}')
 
         # Clean Chat
@@ -904,85 +921,83 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
         cc_tog   = f'{Style.GREEN}██{Style.RESET}' if cc_on else f'{Style.DIM}░░{Style.RESET}'
         cc_st    = f'{Style.BOLD}' if cc_cur else Style.DIM
         cc_val   = f'{Style.GREEN}ON {Style.RESET}' if cc_on else f'{Style.DIM}OFF{Style.RESET}'
-        print(f'  {cc_arrow} {cc_tog} {cc_st}✂️  Clean Chat{Style.RESET}'
-              f' {Style.DIM}(strips IDE context from 👤🤖){Style.RESET}'
-              f'  {Style.DIM}{chat_lines:,}L{Style.RESET}  {cc_val}')
+        chat_lines = agg_lines.get('user_message', 0) + agg_lines.get('agent_message', 0)
+        print(f'  {cc_arrow} {cc_tog} {cc_st}✂️  Clean Chat{Style.RESET} {Style.DIM}(strips IDE context from 👤🤖){Style.RESET}  {Style.DIM}{chat_lines:,}L{Style.RESET}  {cc_val}')
 
         # Output Cap
         cap_cur   = (cursor == ROW_CAP)
         cap_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if cap_cur else ' '
         cap_st    = f'{Style.BOLD}' if cap_cur else Style.DIM
-        if output_cap == 0:
-            cap_label = f'{Style.DIM}ALL{Style.RESET}'
-        else:
-            cap_label = f'{Style.YELLOW}{output_cap}{Style.RESET}'
+        cap_label = f'{Style.DIM}ALL{Style.RESET}' if output_cap == 0 else f'{Style.YELLOW}{output_cap}{Style.RESET}'
         hint = f' {Style.DIM}◀▶{Style.RESET}' if cap_cur else ''
-        print(f'  {cap_arrow}    {cap_st}📏 Output Cap{Style.RESET}'
-              f' {Style.DIM}(max lines per block){Style.RESET}'
-              f'  {cap_label}{hint}')
+        print(f'  {cap_arrow}    {cap_st}💻 Terminal Output Cap{Style.RESET} {Style.DIM}(max lines/block){Style.RESET}  {cap_label}{hint}')
 
-        # ── Footer ──
+        # Msg Cap
+        msg_cur   = (cursor == ROW_MSG)
+        msg_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if msg_cur else ' '
+        msg_st    = f'{Style.BOLD}' if msg_cur else Style.DIM
+        msg_label = f'{Style.DIM}ALL{Style.RESET}' if msg_cap == 0 else f'{Style.YELLOW}Last {msg_cap}{Style.RESET}'
+        msg_hint = f' {Style.DIM}◀▶{Style.RESET}' if msg_cur else ''
+        print(f'  {msg_arrow}    {msg_st}🕒 Chat Message Cap{Style.RESET} {Style.DIM}(blocks for 👤🤖🧠){Style.RESET}  {msg_label}{msg_hint}')
+
         print(f'\n  {Style.DIM}{"━" * 62}{Style.RESET}')
         bar_w = 30
         filled = int(bar_w * pct / 100)
         bar = f'{Style.GREEN}{"█" * filled}{Style.DIM}{"░" * (bar_w - filled)}{Style.RESET}'
         sel_c = Style.GREEN if pct > 0 else Style.RED
-        print(f'  {bar}  {sel_c}{Style.BOLD}{selected_lines:,}{Style.RESET}'
-              f'{Style.DIM}/{Style.RESET}{total_lines:,}  {Style.DIM}({pct:.0f}%){Style.RESET}')
+        print(f'  {bar}  {sel_c}{Style.BOLD}{selected_lines:,}{Style.RESET}{Style.DIM}/{Style.RESET}{total_lines:,}  {Style.DIM}({pct:.0f}%){Style.RESET}')
         print(f'\n  {Style.DIM}↑↓ move  ⏎ toggle  ◀▶ cap  Q export  A all  N none  D defaults  1-7 presets{Style.RESET}')
 
-        # ── Read key ──
         key = read_key()
 
-        if key == 'UP':
-            cursor = (cursor - 1) % num_items
-        elif key == 'DOWN':
-            cursor = (cursor + 1) % num_items
+        if key == 'UP': cursor = (cursor - 1) % num_items
+        elif key == 'DOWN': cursor = (cursor + 1) % num_items
         elif key in ('ENTER', 'SPACE'):
             if cursor < len(SECTION_DEFS):
                 skey = SECTION_DEFS[cursor][0]
                 fstate[skey] = not fstate[skey]
             elif cursor == ROW_CLEAN:
                 clean_content = not clean_content
-            # ROW_CAP: enter does nothing — use ◀▶
         elif key == 'LEFT':
-            cap_idx = max(0, cap_idx - 1)
-            output_cap = CAP_STEPS[cap_idx]
+            if cursor == ROW_CAP:
+                cap_idx = max(0, cap_idx - 1)
+                output_cap = CAP_STEPS[cap_idx]
+            elif cursor == ROW_MSG:
+                msg_idx = max(0, msg_idx - 1)
+                msg_cap = MSG_CAP_STEPS[msg_idx]
         elif key == 'RIGHT':
-            cap_idx = min(len(CAP_STEPS) - 1, cap_idx + 1)
-            output_cap = CAP_STEPS[cap_idx]
+            if cursor == ROW_CAP:
+                cap_idx = min(len(CAP_STEPS) - 1, cap_idx + 1)
+                output_cap = CAP_STEPS[cap_idx]
+            elif cursor == ROW_MSG:
+                msg_idx = min(len(MSG_CAP_STEPS) - 1, msg_idx + 1)
+                msg_cap = MSG_CAP_STEPS[msg_idx]
         elif key == 'A':
-            for s in SECTION_DEFS:
-                fstate[s[0]] = True
+            for s in SECTION_DEFS: fstate[s[0]] = True
         elif key == 'N':
-            for s in SECTION_DEFS:
-                fstate[s[0]] = False
+            for s in SECTION_DEFS: fstate[s[0]] = False
         elif key == 'I':
-            for s in SECTION_DEFS:
-                fstate[s[0]] = not fstate[s[0]]
+            for s in SECTION_DEFS: fstate[s[0]] = not fstate[s[0]]
         elif key == 'D':
-            for s in SECTION_DEFS:
-                fstate[s[0]] = s[3]
+            for s in SECTION_DEFS: fstate[s[0]] = s[3]
             clean_content = False
             output_cap = 8
             cap_idx = CAP_STEPS.index(8)
-        elif key == 'Q':
-            break
-        elif key == 'ESC':
+            msg_cap = 0
+            msg_idx = MSG_CAP_STEPS.index(0)
+        elif key == 'Q' or key == 'ESC':
             break
         elif key.isdigit():
             pi = int(key) - 1
             if 0 <= pi < len(FILTER_PRESETS):
                 _pname, pkeys, pclean = FILTER_PRESETS[pi]
                 if pkeys is None:
-                    for s in SECTION_DEFS:
-                        fstate[s[0]] = s[3]
+                    for s in SECTION_DEFS: fstate[s[0]] = s[3]
                 else:
-                    for s in SECTION_DEFS:
-                        fstate[s[0]] = s[0] in pkeys
+                    for s in SECTION_DEFS: fstate[s[0]] = s[0] in pkeys
                 clean_content = pclean
 
-    return fstate, clean_content, output_cap
+    return fstate, clean_content, output_cap, msg_cap
 
 # ──────────────────────────────────────────────────────────────
 # Session List & Main Loop
@@ -1112,7 +1127,7 @@ def process_conversion(indices_str: str, files: List[Path]):
         return
 
     # Interactive filter
-    section_filter, clean_content, output_cap = interactive_filter(parsers)
+    section_filter, clean_content, output_cap, msg_cap = interactive_filter(parsers)
 
     # Check anything is selected
     if not any(section_filter.values()):
@@ -1149,6 +1164,7 @@ def process_conversion(indices_str: str, files: List[Path]):
                 section_filter=section_filter,
                 clean_content=clean_content,
                 output_cap=output_cap,
+                msg_cap=msg_cap,
             )
 
             date_prefix = datetime.fromtimestamp(
