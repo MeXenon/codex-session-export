@@ -6,7 +6,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.x](https://img.shields.io/badge/python-3.x-blue.svg)](https://www.python.org/)
-[![Hits](https://hits.seeyoufarm.com/api/count/incr/badge.svg?url=https%3A%2F%2Fgithub.com%2FMeXenon%2Fcodex-session-export&count_bg=%2379C83D&title_bg=%23555555&icon=&icon_color=%23E7E7E7&title=visitors&edge_flat=false)](https://hits.seeyoufarm.com)
+[![Visitors](https://komarev.com/ghpvc/?username=mexenon-codexsessionexport&label=visitors&color=1d70b8&style=flat)](https://github.com/MeXenon/codex-session-export)
 
 **The ultimate, terminal-native export pipeline for Codex.**
 
@@ -87,11 +87,11 @@ python codex-md.py
 
 ## 📈 Activity & Growth
 
-<a href="https://star-history.com/#MeXenon/codex-session-export&Date">
+<a href="https://star-history.com/#mexenon/codex-session-export&Date">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=MeXenon/codex-session-export&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=MeXenon/codex-session-export&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=MeXenon/codex-session-export&type=Date" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=mexenon/codex-session-export&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=mexenon/codex-session-export&type=Date" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=mexenon/codex-session-export&type=Date" />
  </picture>
 </a>
 
