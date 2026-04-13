@@ -51,11 +51,22 @@ Because it's a pure Python CLI tool, it's completely **portable**. You can use i
 No complex dependencies. Just download and run the script using Python.
 
 ### 🚀 Quick Start (One-Liner)
-Run the software instantly without manually cloning the repo:
 
-**Linux / macOS:**
+Run the software instantly — no cloning needed.
+
+**🐧 Linux / 🍎 macOS:**
 ```bash
 curl -sO https://raw.githubusercontent.com/MeXenon/codex-session-export/main/codex-md.py && python3 codex-md.py
+```
+
+**🪟 Windows — Command Prompt (cmd.exe):**
+```cmd
+curl -sO https://raw.githubusercontent.com/MeXenon/codex-session-export/main/codex-md.py && python codex-md.py
+```
+
+**🪟 Windows — PowerShell 7:**
+```powershell
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/MeXenon/codex-session-export/main/codex-md.py" -OutFile "codex-md.py"; python codex-md.py
 ```
 
 ### 💻 Manual Run
