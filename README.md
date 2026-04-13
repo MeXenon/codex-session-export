@@ -87,13 +87,7 @@ python codex-md.py
 
 ## 📈 Activity & Growth
 
-<a href="https://star-history.com/#mexenon/codex-session-export&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=mexenon/codex-session-export&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=mexenon/codex-session-export&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=mexenon/codex-session-export&type=Date" />
- </picture>
-</a>
+[![Star History Chart](https://api.star-history.com/svg?repos=mexenon/codex-session-export&type=Date&v=2)](https://star-history.com/#mexenon/codex-session-export&Date)
 
 ---
 
