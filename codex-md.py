@@ -833,12 +833,13 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
     """
     _line_cache = {}
     
-    def get_lines_for_state(cap_out: int, cap_user: int, cap_agent: int, cap_reason: int, cc: bool) -> Dict[str, int]:
+    def get_lines_for_state(cap_out: int, cap_user: int, cap_agent: int, cap_reason: int, cc: bool):
         cache_key = (cap_out, cap_user, cap_agent, cap_reason, cc)
         if cache_key in _line_cache:
             return _line_cache[cache_key]
         
         counts = {s[0]: 0 for s in SECTION_DEFS}
+        msg_counts: Dict[str, int] = {}  # actual block/message counts for chat types
         tool_call_types = {'terminal_cmd', 'mcp_tool', 'other_tool'}
         tool_output_types = {'terminal_output', 'mcp_tool_output', 'other_tool_output'}
         
@@ -862,6 +863,10 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
                 if i not in keep_indices: continue
                 itype = item['type']
                 content = item.get('content', '')
+                
+                # Count actual messages for chat-type sections
+                if itype in ('user_message', 'agent_message', 'agent_reasoning', 'reasoning'):
+                    msg_counts[itype] = msg_counts.get(itype, 0) + 1
                 
                 if itype == 'user_message':
                     if cc: content = trim_chat_content(content)
@@ -897,8 +902,8 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
             if parser.metadata:
                 counts['session_meta'] = counts.get('session_meta', 0) + 5
                 
-        _line_cache[cache_key] = counts
-        return counts
+        _line_cache[cache_key] = (counts, msg_counts)
+        return counts, msg_counts
 
     fstate: Dict[str, bool] = {s[0]: s[3] for s in SECTION_DEFS}
     clean_content = False
@@ -924,7 +929,7 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
     num_items = len(SECTION_DEFS) + 5
 
     while True:
-        agg_lines = get_lines_for_state(output_cap, user_cap, agent_cap, reason_cap, clean_content)
+        agg_lines, agg_msgs = get_lines_for_state(output_cap, user_cap, agent_cap, reason_cap, clean_content)
         total_lines = sum(agg_lines.get(s[0], 0) for s in SECTION_DEFS)
         selected_lines = sum(agg_lines.get(s[0], 0) for s in SECTION_DEFS if fstate.get(s[0], False))
         pct = (selected_lines / total_lines * 100) if total_lines > 0 else 0
@@ -948,6 +953,13 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
             elif is_on: nstyle = ''
             else: nstyle = Style.DIM
 
+            _MSG_COUNT_TYPES = {'user_message', 'agent_message', 'agent_reasoning', 'reasoning'}
+            msg_n = agg_msgs.get(key, 0)
+            if key in _MSG_COUNT_TYPES and msg_n > 0:
+                msg_label = f' {Style.DIM}({msg_n:,} Msg){Style.RESET}'
+            else:
+                msg_label = ''
+
             count_str = f'{Style.CYAN}{lines:>6,}{Style.RESET}' if is_on and lines > 0 else f'{Style.DIM}{lines:>6,}{Style.RESET}'
             if lines == 0: count_str = f'{Style.DIM}     0{Style.RESET}'
 
@@ -955,7 +967,7 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
             pad_len = max(1, 44 - len(visible_name))
             dots = f'{Style.DIM}{"·" * pad_len}{Style.RESET}'
 
-            print(f'  {arrow} {toggle} {nstyle}{visible_name}{Style.RESET} {dots} {count_str}')
+            print(f'  {arrow} {toggle} {nstyle}{visible_name}{Style.RESET} {dots} {count_str}{msg_label}')
 
         print(f'  {Style.DIM}{"─" * 62}{Style.RESET}')
 
