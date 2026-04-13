@@ -24,13 +24,13 @@ You might need to:
 - Read through the agent's hidden internal reasoning.
 - Strip away thousands of lines of verbose tool outputs to see the actual conversation.
 
-Currently, there’s no official feature built for this granular level of control. If you just export raw logs, you get a massive, unreadable wall of text. 
+Currently, there's no official feature built for this granular level of control. If you just export raw logs, you get a massive, unreadable wall of text. 
 
 ## 💡 The Solution
 
 **Codex Session Manager** (`codex-md.py`) is designed for maximum flexibility. It parses your local `.jsonl` session logs and provides a beautiful, interactive, fullscreen terminal UI (TUI) to dynamically filter exactly what you want to export into clean Markdown. 
 
-Because it’s a pure Python CLI tool, it's completely **portable**. You can use it locally on your laptop, or run it headlessly on a remote VPS. It is 100% compatible with the Codex CLI extension and app.
+Because it's a pure Python CLI tool, it's completely **portable**. You can use it locally on your laptop, or run it headlessly on a remote VPS. It is 100% compatible with the Codex CLI extension and app.
 
 ---
 
@@ -38,7 +38,8 @@ Because it’s a pure Python CLI tool, it's completely **portable**. You can use
 
 - **20 Filterable Sections:** Toggle everything from User/Agent messages to hidden agent reasoning, terminal commands, MCP tool calls, git snapshots, and more.
 - **Parallel Exports:** Select and process multiple sessions at the same time. The filter will show you the combined line counts and will export them simultaneously in one batch.
-- **Granular Output & Chat Capping:** Terminal payloads or massive chat histories can ruin context windows. Now you can independently cap **Terminal Outputs**, **User Messages**, **Agent Messages**, and **Agent Reasoning** to keep your exports perfectly concise (e.g., "Last 10", "Last 50", or up to 500 blocks).
+- **Dynamic Output Capping:** Terminal payloads can be hundreds of thousands of lines long. Instantly cap output blocks to exactly 1, 5, 8, 10, or up to 500 lines to keep your context windows lean.
+- **Granular Message Filtering *(New in v2.1)*:** Independently control how many of the **last N** blocks you want from each message type — 👤 User, 🤖 Agent, and 🧠 Reasoning — all separately adjustable via `◀`/`▶`. Each defaults to ALL, so you only cut what you need.
 - **"Clean Chat" Mode:** Instantly strips messy IDE background data, active-file streams, and open-tab XML that the agent silently attaches to your prompt, leaving just your actual words.
 - **7 Built-in Presets:** Jump straight to "Chat Only", "Terminal Only", "Outputs Only", or "Full Export" with a single keystroke.
 - **Real-Time Context Math:** See exactly how many lines you are selecting *before* you export, complete with a live progress bar.
@@ -74,10 +75,13 @@ python codex-md.py
 
 1. **Select a session:** The script automatically scans `~/.codex/sessions` and presents a chronological list of your recent threads. Type the ID of the session (e.g., `1`) or select multiple (e.g., `1,2,3`).
 2. **Filter & Refine:** 
-   * `↑` / `↓` - Navigate the filter list
-   * `Enter` / `Space` - Toggle a section ON/OFF
-   * `◀` / `▶` - Adjust the Block Caps (Terminal, User, Agent, Reasoning limits)
-   * `1`-`7` - Load presets
+   * `↑` / `↓` — Navigate the filter list
+   * `Enter` / `Space` — Toggle a section ON/OFF
+   * `◀` / `▶` on **💻 Terminal Output Cap** — Adjust max lines per terminal/tool output block
+   * `◀` / `▶` on **👤 User Message Cap** — Keep only the last N user messages
+   * `◀` / `▶` on **🤖 Agent Message Cap** — Keep only the last N agent responses
+   * `◀` / `▶` on **🧠 Agent Reasoning Cap** — Keep only the last N reasoning blocks
+   * `1`–`7` — Load presets
 3. **Export Destination:** Press `Q` when you're ready, and you will be asked where to send the output:
    * **[F]ile:** Save directly to a `.md` file in the current directory (Default).
    * **[C]lipboard:** Instantly copy the raw Markdown so you can paste it straight into ChatGPT or Claude.
