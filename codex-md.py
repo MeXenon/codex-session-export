@@ -18,11 +18,15 @@ import sys
 import json
 import glob
 import re
-import tty
-import termios
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set
+
+# Platform-specific terminal handling
+_IS_WINDOWS = sys.platform == 'win32'
+if not _IS_WINDOWS:
+    import tty
+    import termios
 
 # ──────────────────────────────────────────────────────────────
 # Terminal Styling
@@ -771,27 +775,46 @@ class SessionParser:
 # ──────────────────────────────────────────────────────────────
 # Keyboard Input (raw terminal, single keypress)
 # ──────────────────────────────────────────────────────────────
+def _clear_screen():
+    """Cross-platform screen clear."""
+    os.system('cls' if _IS_WINDOWS else 'clear')
+
 def read_key() -> str:
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ch = sys.stdin.read(1)
-        if ch == '\x1b':
-            ch2 = sys.stdin.read(1)
-            if ch2 == '[':
-                ch3 = sys.stdin.read(1)
-                return {'A': 'UP', 'B': 'DOWN', 'C': 'RIGHT', 'D': 'LEFT'}.get(ch3, '')
-            return 'ESC'
+    """Read a single keypress cross-platform."""
+    if _IS_WINDOWS:
+        import msvcrt
+        ch = msvcrt.getwch()
         if ch in ('\r', '\n'):
             return 'ENTER'
         if ch == ' ':
             return 'SPACE'
         if ch == '\x03':
             raise KeyboardInterrupt
+        if ch == '\xe0' or ch == '\x00':  # special key prefix on Windows
+            ext = msvcrt.getwch()
+            return {'H': 'UP', 'P': 'DOWN', 'M': 'RIGHT', 'K': 'LEFT'}.get(ext, '')
         return ch.upper()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    else:
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == '\x1b':
+                ch2 = sys.stdin.read(1)
+                if ch2 == '[':
+                    ch3 = sys.stdin.read(1)
+                    return {'A': 'UP', 'B': 'DOWN', 'C': 'RIGHT', 'D': 'LEFT'}.get(ch3, '')
+                return 'ESC'
+            if ch in ('\r', '\n'):
+                return 'ENTER'
+            if ch == ' ':
+                return 'SPACE'
+            if ch == '\x03':
+                raise KeyboardInterrupt
+            return ch.upper()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 # ──────────────────────────────────────────────────────────────
 # Interactive Section Filter
@@ -907,7 +930,7 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
         pct = (selected_lines / total_lines * 100) if total_lines > 0 else 0
 
         # ── Render ──
-        os.system('clear')
+        _clear_screen()
         sessions_label = f"{len(parsers)} session{'s' if len(parsers) > 1 else ''}"
         print(f"\n  {Style.BOLD}{Style.HEADER}SECTION FILTER{Style.RESET}  {Style.DIM}({sessions_label}){Style.RESET}")
         print(f"  {Style.DIM}{'━' * 62}{Style.RESET}\n")
@@ -1189,7 +1212,7 @@ def process_conversion(indices_str: str, files: List[Path]):
         input(f"\n{Style.DIM}Press Enter to return to menu...{Style.RESET}")
         return
 
-    os.system('clear')
+    _clear_screen()
     
     # Ask for export destination
     dest_choice = ''
