@@ -46,7 +46,18 @@ Because it’s a pure Python CLI tool, it's completely **portable**. You can use
 
 ## 🛠 Usage
 
-No complex dependencies. Just clone and run the script using Python.
+No complex dependencies. Just download and run the script using Python.
+
+### 🚀 Quick Start (One-Liner)
+Run the software instantly without manually cloning the repo:
+
+**Linux / macOS:**
+```bash
+curl -sO https://raw.githubusercontent.com/MeXenon/codex-session-export/main/codex-md.py && python3 codex-md.py
+```
+
+### 💻 Manual Run
+If you prefer to download or clone the file manually:
 
 **Linux / macOS:**
 ```bash
