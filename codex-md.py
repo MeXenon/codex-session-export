@@ -640,7 +640,7 @@ class SessionParser:
 
     # --- markdown rendering with filter ---
     def to_markdown(self, section_filter: Optional[Dict[str, bool]] = None,
-                    clean_content: bool = False, output_cap: int = 0, user_cap: int = 0, agent_cap: int = 0, reasoning_cap: int = 0) -> str:
+                    clean_content: bool = False, output_cap: int = 0, user_cap: int = 0, agent_cap: int = 0, reasoning_cap: int = 0, internal_cap: int = 0) -> str:
         if section_filter is None:
             section_filter = {s[0]: True for s in SECTION_DEFS}
 
@@ -655,7 +655,7 @@ class SessionParser:
             return f'... ({len(lines) - output_cap} lines trimmed) ...\n' + '\n'.join(kept)
 
         keep_indices = set(range(len(self.data)))
-        counts = {'user_message': 0, 'agent_message': 0, 'reasoning_group': 0}
+        counts = {'user_message': 0, 'agent_message': 0, 'agent_reasoning': 0, 'reasoning': 0}
         
         for i in range(len(self.data) - 1, -1, -1):
             itype = self.data[i]['type']
@@ -665,9 +665,12 @@ class SessionParser:
             elif itype == 'agent_message' and agent_cap > 0:
                 if counts['agent_message'] >= agent_cap: keep_indices.remove(i)
                 counts['agent_message'] += 1
-            elif itype in ('agent_reasoning', 'reasoning') and reasoning_cap > 0:
-                if counts['reasoning_group'] >= reasoning_cap: keep_indices.remove(i)
-                counts['reasoning_group'] += 1
+            elif itype == 'agent_reasoning' and reasoning_cap > 0:
+                if counts['agent_reasoning'] >= reasoning_cap: keep_indices.remove(i)
+                counts['agent_reasoning'] += 1
+            elif itype == 'reasoning' and internal_cap > 0:
+                if counts['reasoning'] >= internal_cap: keep_indices.remove(i)
+                counts['reasoning'] += 1
 
         md: List[str] = []
         md.append(f"# {self.title}\n")
@@ -829,12 +832,12 @@ MSG_CAP_STEPS = [0, 5] + list(range(10, 101, 10)) + [150, 200, 300, 500]
 def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], bool, int, int, int, int]:
     """
     Full-screen interactive filter.
-    Returns (section_filter, clean_content, output_cap, user_cap, agent_cap, reasoning_cap).
+    Returns (section_filter, clean_content, output_cap, user_cap, agent_cap, reasoning_cap, internal_cap).
     """
     _line_cache = {}
     
-    def get_lines_for_state(cap_out: int, cap_user: int, cap_agent: int, cap_reason: int, cc: bool):
-        cache_key = (cap_out, cap_user, cap_agent, cap_reason, cc)
+    def get_lines_for_state(cap_out: int, cap_user: int, cap_agent: int, cap_reason: int, cap_internal: int, cc: bool):
+        cache_key = (cap_out, cap_user, cap_agent, cap_reason, cap_internal, cc)
         if cache_key in _line_cache:
             return _line_cache[cache_key]
         
@@ -845,7 +848,7 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
         
         for parser in parsers:
             keep_indices = set(range(len(parser.data)))
-            chat_counts = {'u': 0, 'a': 0, 'r': 0}
+            chat_counts = {'u': 0, 'a': 0, 'r': 0, 'i': 0}
             
             for i in range(len(parser.data) - 1, -1, -1):
                 itype = parser.data[i]['type']
@@ -855,9 +858,12 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
                 elif itype == 'agent_message' and cap_agent > 0:
                     if chat_counts['a'] >= cap_agent: keep_indices.remove(i)
                     chat_counts['a'] += 1
-                elif itype in ('agent_reasoning', 'reasoning') and cap_reason > 0:
+                elif itype == 'agent_reasoning' and cap_reason > 0:
                     if chat_counts['r'] >= cap_reason: keep_indices.remove(i)
                     chat_counts['r'] += 1
+                elif itype == 'reasoning' and cap_internal > 0:
+                    if chat_counts['i'] >= cap_internal: keep_indices.remove(i)
+                    chat_counts['i'] += 1
             
             for i, item in enumerate(parser.data):
                 if i not in keep_indices: continue
@@ -919,6 +925,9 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
     
     reason_cap = 0
     r_idx = 0
+    
+    internal_cap = 0
+    i_idx = 0
 
     cursor = 0
     ROW_CLEAN = len(SECTION_DEFS)
@@ -926,10 +935,11 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
     ROW_USER  = len(SECTION_DEFS) + 2
     ROW_AGENT = len(SECTION_DEFS) + 3
     ROW_REASON= len(SECTION_DEFS) + 4
-    num_items = len(SECTION_DEFS) + 5
+    ROW_INTERNAL = len(SECTION_DEFS) + 5
+    num_items = len(SECTION_DEFS) + 6
 
     while True:
-        agg_lines, agg_msgs = get_lines_for_state(output_cap, user_cap, agent_cap, reason_cap, clean_content)
+        agg_lines, agg_msgs = get_lines_for_state(output_cap, user_cap, agent_cap, reason_cap, internal_cap, clean_content)
         total_lines = sum(agg_lines.get(s[0], 0) for s in SECTION_DEFS)
         selected_lines = sum(agg_lines.get(s[0], 0) for s in SECTION_DEFS if fstate.get(s[0], False))
         pct = (selected_lines / total_lines * 100) if total_lines > 0 else 0
@@ -1013,6 +1023,14 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
         r_hint = f' {Style.DIM}◀▶{Style.RESET}' if r_cur else ''
         print(f'  {r_arrow}    {r_st}🧠 Agent Reasoning Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}          {r_label}{r_hint}')
 
+        # Internal Reasoning Cap
+        i_cur   = (cursor == ROW_INTERNAL)
+        i_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if i_cur else ' '
+        i_st    = f'{Style.BOLD}' if i_cur else Style.DIM
+        i_label = f'{Style.DIM}ALL{Style.RESET}' if internal_cap == 0 else f'{Style.YELLOW}Last {internal_cap}{Style.RESET}'
+        i_hint = f' {Style.DIM}◀▶{Style.RESET}' if i_cur else ''
+        print(f'  {i_arrow}    {i_st}🔒 Internal Reasoning Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}       {i_label}{i_hint}')
+
         print(f'\n  {Style.DIM}{"━" * 62}{Style.RESET}')
         bar_w = 30
         filled = int(bar_w * pct / 100)
@@ -1044,6 +1062,9 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
             elif cursor == ROW_REASON:
                 r_idx = max(0, r_idx - 1)
                 reason_cap = MSG_CAP_STEPS[r_idx]
+            elif cursor == ROW_INTERNAL:
+                i_idx = max(0, i_idx - 1)
+                internal_cap = MSG_CAP_STEPS[i_idx]
         elif key == 'RIGHT':
             if cursor == ROW_CAP:
                 cap_idx = min(len(CAP_STEPS) - 1, cap_idx + 1)
@@ -1057,6 +1078,9 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
             elif cursor == ROW_REASON:
                 r_idx = min(len(MSG_CAP_STEPS) - 1, r_idx + 1)
                 reason_cap = MSG_CAP_STEPS[r_idx]
+            elif cursor == ROW_INTERNAL:
+                i_idx = min(len(MSG_CAP_STEPS) - 1, i_idx + 1)
+                internal_cap = MSG_CAP_STEPS[i_idx]
         elif key == 'A':
             for s in SECTION_DEFS: fstate[s[0]] = True
         elif key == 'N':
@@ -1074,6 +1098,8 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
             a_idx = 0
             reason_cap = 0
             r_idx = 0
+            internal_cap = 0
+            i_idx = 0
         elif key == 'Q' or key == 'ESC':
             break
         elif key.isdigit():
@@ -1086,7 +1112,7 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
                     for s in SECTION_DEFS: fstate[s[0]] = s[0] in pkeys
                 clean_content = pclean
 
-    return fstate, clean_content, output_cap, user_cap, agent_cap, reason_cap
+    return fstate, clean_content, output_cap, user_cap, agent_cap, reason_cap, internal_cap
 
 # ──────────────────────────────────────────────────────────────
 # Session List & Main Loop
@@ -1216,7 +1242,7 @@ def process_conversion(indices_str: str, files: List[Path]):
         return
 
     # Interactive filter
-    section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap = interactive_filter(parsers)
+    section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap, internal_cap = interactive_filter(parsers)
 
     # Check anything is selected
     if not any(section_filter.values()):
@@ -1256,6 +1282,7 @@ def process_conversion(indices_str: str, files: List[Path]):
                 user_cap=user_cap,
                 agent_cap=agent_cap,
                 reasoning_cap=reason_cap,
+                internal_cap=internal_cap,
             )
 
             date_prefix = datetime.fromtimestamp(
