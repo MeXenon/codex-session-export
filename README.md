@@ -38,7 +38,7 @@ Because it’s a pure Python CLI tool, it's completely **portable**. You can use
 
 - **20 Filterable Sections:** Toggle everything from User/Agent messages to hidden agent reasoning, terminal commands, MCP tool calls, git snapshots, and more.
 - **Parallel Exports:** Select and process multiple sessions at the same time. The filter will show you the combined line counts and will export them simultaneously in one batch.
-- **Dynamic Output Capping:** Terminal payloads can be hundreds of thousands of lines long. Instantly cap output blocks to exactly 1, 5, 8, 10, or up to 500 lines to keep your context windows lean.
+- **Granular Output & Chat Capping:** Terminal payloads or massive chat histories can ruin context windows. Now you can independently cap **Terminal Outputs**, **User Messages**, **Agent Messages**, and **Agent Reasoning** to keep your exports perfectly concise (e.g., "Last 10", "Last 50", or up to 500 blocks).
 - **"Clean Chat" Mode:** Instantly strips messy IDE background data, active-file streams, and open-tab XML that the agent silently attaches to your prompt, leaving just your actual words.
 - **7 Built-in Presets:** Jump straight to "Chat Only", "Terminal Only", "Outputs Only", or "Full Export" with a single keystroke.
 - **Real-Time Context Math:** See exactly how many lines you are selecting *before* you export, complete with a live progress bar.
@@ -76,7 +76,7 @@ python codex-md.py
 2. **Filter & Refine:** 
    * `↑` / `↓` - Navigate the filter list
    * `Enter` / `Space` - Toggle a section ON/OFF
-   * `◀` / `▶` - Adjust the Output Cap (e.g., max 8 lines per output block)
+   * `◀` / `▶` - Adjust the Block Caps (Terminal, User, Agent, Reasoning limits)
    * `1`-`7` - Load presets
 3. **Export Destination:** Press `Q` when you're ready, and you will be asked where to send the output:
    * **[F]ile:** Save directly to a `.md` file in the current directory (Default).
