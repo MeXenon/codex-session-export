@@ -636,7 +636,7 @@ class SessionParser:
 
     # --- markdown rendering with filter ---
     def to_markdown(self, section_filter: Optional[Dict[str, bool]] = None,
-                    clean_content: bool = False, output_cap: int = 0, msg_cap: int = 0) -> str:
+                    clean_content: bool = False, output_cap: int = 0, user_cap: int = 0, agent_cap: int = 0, reasoning_cap: int = 0) -> str:
         if section_filter is None:
             section_filter = {s[0]: True for s in SECTION_DEFS}
 
@@ -651,13 +651,19 @@ class SessionParser:
             return f'... ({len(lines) - output_cap} lines trimmed) ...\n' + '\n'.join(kept)
 
         keep_indices = set(range(len(self.data)))
-        if msg_cap > 0:
-            chat_msg_count = 0
-            for i in range(len(self.data) - 1, -1, -1):
-                if self.data[i]['type'] in {'user_message', 'agent_message', 'agent_reasoning', 'reasoning'}:
-                    if chat_msg_count >= msg_cap:
-                        keep_indices.remove(i)
-                    chat_msg_count += 1
+        counts = {'user_message': 0, 'agent_message': 0, 'reasoning_group': 0}
+        
+        for i in range(len(self.data) - 1, -1, -1):
+            itype = self.data[i]['type']
+            if itype == 'user_message' and user_cap > 0:
+                if counts['user_message'] >= user_cap: keep_indices.remove(i)
+                counts['user_message'] += 1
+            elif itype == 'agent_message' and agent_cap > 0:
+                if counts['agent_message'] >= agent_cap: keep_indices.remove(i)
+                counts['agent_message'] += 1
+            elif itype in ('agent_reasoning', 'reasoning') and reasoning_cap > 0:
+                if counts['reasoning_group'] >= reasoning_cap: keep_indices.remove(i)
+                counts['reasoning_group'] += 1
 
         md: List[str] = []
         md.append(f"# {self.title}\n")
@@ -797,15 +803,15 @@ OUTPUT_SECTIONS = {'terminal_output', 'mcp_tool_output', 'other_tool_output', 'c
 CAP_STEPS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30, 50, 100, 200, 500]
 MSG_CAP_STEPS = [0, 5, 10, 20, 50] + list(range(70, 511, 20))
 
-def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], bool, int, int]:
+def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], bool, int, int, int, int]:
     """
     Full-screen interactive filter.
-    Returns (section_filter, clean_content, output_cap, msg_cap).
+    Returns (section_filter, clean_content, output_cap, user_cap, agent_cap, reasoning_cap).
     """
     _line_cache = {}
     
-    def get_lines_for_state(cap_out: int, cap_msg: int, cc: bool) -> Dict[str, int]:
-        cache_key = (cap_out, cap_msg, cc)
+    def get_lines_for_state(cap_out: int, cap_user: int, cap_agent: int, cap_reason: int, cc: bool) -> Dict[str, int]:
+        cache_key = (cap_out, cap_user, cap_agent, cap_reason, cc)
         if cache_key in _line_cache:
             return _line_cache[cache_key]
         
@@ -815,13 +821,19 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
         
         for parser in parsers:
             keep_indices = set(range(len(parser.data)))
-            if cap_msg > 0:
-                chat_msg_count = 0
-                for i in range(len(parser.data) - 1, -1, -1):
-                    if parser.data[i]['type'] in {'user_message', 'agent_message', 'agent_reasoning', 'reasoning'}:
-                        if chat_msg_count >= cap_msg:
-                            keep_indices.remove(i)
-                        chat_msg_count += 1
+            chat_counts = {'u': 0, 'a': 0, 'r': 0}
+            
+            for i in range(len(parser.data) - 1, -1, -1):
+                itype = parser.data[i]['type']
+                if itype == 'user_message' and cap_user > 0:
+                    if chat_counts['u'] >= cap_user: keep_indices.remove(i)
+                    chat_counts['u'] += 1
+                elif itype == 'agent_message' and cap_agent > 0:
+                    if chat_counts['a'] >= cap_agent: keep_indices.remove(i)
+                    chat_counts['a'] += 1
+                elif itype in ('agent_reasoning', 'reasoning') and cap_reason > 0:
+                    if chat_counts['r'] >= cap_reason: keep_indices.remove(i)
+                    chat_counts['r'] += 1
             
             for i, item in enumerate(parser.data):
                 if i not in keep_indices: continue
@@ -867,19 +879,29 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
 
     fstate: Dict[str, bool] = {s[0]: s[3] for s in SECTION_DEFS}
     clean_content = False
+    
     output_cap = 8
     cap_idx = CAP_STEPS.index(8)
-    msg_cap = 0
-    msg_idx = MSG_CAP_STEPS.index(0)
+    
+    user_cap = 0
+    u_idx = 0
+    
+    agent_cap = 0
+    a_idx = 0
+    
+    reason_cap = 0
+    r_idx = 0
 
     cursor = 0
     ROW_CLEAN = len(SECTION_DEFS)
     ROW_CAP   = len(SECTION_DEFS) + 1
-    ROW_MSG   = len(SECTION_DEFS) + 2
-    num_items = len(SECTION_DEFS) + 3
+    ROW_USER  = len(SECTION_DEFS) + 2
+    ROW_AGENT = len(SECTION_DEFS) + 3
+    ROW_REASON= len(SECTION_DEFS) + 4
+    num_items = len(SECTION_DEFS) + 5
 
     while True:
-        agg_lines = get_lines_for_state(output_cap, msg_cap, clean_content)
+        agg_lines = get_lines_for_state(output_cap, user_cap, agent_cap, reason_cap, clean_content)
         total_lines = sum(agg_lines.get(s[0], 0) for s in SECTION_DEFS)
         selected_lines = sum(agg_lines.get(s[0], 0) for s in SECTION_DEFS if fstate.get(s[0], False))
         pct = (selected_lines / total_lines * 100) if total_lines > 0 else 0
@@ -932,13 +954,29 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
         hint = f' {Style.DIM}◀▶{Style.RESET}' if cap_cur else ''
         print(f'  {cap_arrow}    {cap_st}💻 Terminal Output Cap{Style.RESET} {Style.DIM}(max lines/block){Style.RESET}  {cap_label}{hint}')
 
-        # Msg Cap
-        msg_cur   = (cursor == ROW_MSG)
-        msg_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if msg_cur else ' '
-        msg_st    = f'{Style.BOLD}' if msg_cur else Style.DIM
-        msg_label = f'{Style.DIM}ALL{Style.RESET}' if msg_cap == 0 else f'{Style.YELLOW}Last {msg_cap}{Style.RESET}'
-        msg_hint = f' {Style.DIM}◀▶{Style.RESET}' if msg_cur else ''
-        print(f'  {msg_arrow}    {msg_st}🕒 Chat Message Cap{Style.RESET} {Style.DIM}(blocks for 👤🤖🧠){Style.RESET}  {msg_label}{msg_hint}')
+        # User Cap
+        u_cur   = (cursor == ROW_USER)
+        u_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if u_cur else ' '
+        u_st    = f'{Style.BOLD}' if u_cur else Style.DIM
+        u_label = f'{Style.DIM}ALL{Style.RESET}' if user_cap == 0 else f'{Style.YELLOW}Last {user_cap}{Style.RESET}'
+        u_hint = f' {Style.DIM}◀▶{Style.RESET}' if u_cur else ''
+        print(f'  {u_arrow}    {u_st}👤 User Message Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}             {u_label}{u_hint}')
+
+        # Agent Cap
+        a_cur   = (cursor == ROW_AGENT)
+        a_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if a_cur else ' '
+        a_st    = f'{Style.BOLD}' if a_cur else Style.DIM
+        a_label = f'{Style.DIM}ALL{Style.RESET}' if agent_cap == 0 else f'{Style.YELLOW}Last {agent_cap}{Style.RESET}'
+        a_hint = f' {Style.DIM}◀▶{Style.RESET}' if a_cur else ''
+        print(f'  {a_arrow}    {a_st}🤖 Agent Message Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}            {a_label}{a_hint}')
+
+        # Reason Cap
+        r_cur   = (cursor == ROW_REASON)
+        r_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if r_cur else ' '
+        r_st    = f'{Style.BOLD}' if r_cur else Style.DIM
+        r_label = f'{Style.DIM}ALL{Style.RESET}' if reason_cap == 0 else f'{Style.YELLOW}Last {reason_cap}{Style.RESET}'
+        r_hint = f' {Style.DIM}◀▶{Style.RESET}' if r_cur else ''
+        print(f'  {r_arrow}    {r_st}🧠 Agent Reasoning Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}          {r_label}{r_hint}')
 
         print(f'\n  {Style.DIM}{"━" * 62}{Style.RESET}')
         bar_w = 30
@@ -962,16 +1000,28 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
             if cursor == ROW_CAP:
                 cap_idx = max(0, cap_idx - 1)
                 output_cap = CAP_STEPS[cap_idx]
-            elif cursor == ROW_MSG:
-                msg_idx = max(0, msg_idx - 1)
-                msg_cap = MSG_CAP_STEPS[msg_idx]
+            elif cursor == ROW_USER:
+                u_idx = max(0, u_idx - 1)
+                user_cap = MSG_CAP_STEPS[u_idx]
+            elif cursor == ROW_AGENT:
+                a_idx = max(0, a_idx - 1)
+                agent_cap = MSG_CAP_STEPS[a_idx]
+            elif cursor == ROW_REASON:
+                r_idx = max(0, r_idx - 1)
+                reason_cap = MSG_CAP_STEPS[r_idx]
         elif key == 'RIGHT':
             if cursor == ROW_CAP:
                 cap_idx = min(len(CAP_STEPS) - 1, cap_idx + 1)
                 output_cap = CAP_STEPS[cap_idx]
-            elif cursor == ROW_MSG:
-                msg_idx = min(len(MSG_CAP_STEPS) - 1, msg_idx + 1)
-                msg_cap = MSG_CAP_STEPS[msg_idx]
+            elif cursor == ROW_USER:
+                u_idx = min(len(MSG_CAP_STEPS) - 1, u_idx + 1)
+                user_cap = MSG_CAP_STEPS[u_idx]
+            elif cursor == ROW_AGENT:
+                a_idx = min(len(MSG_CAP_STEPS) - 1, a_idx + 1)
+                agent_cap = MSG_CAP_STEPS[a_idx]
+            elif cursor == ROW_REASON:
+                r_idx = min(len(MSG_CAP_STEPS) - 1, r_idx + 1)
+                reason_cap = MSG_CAP_STEPS[r_idx]
         elif key == 'A':
             for s in SECTION_DEFS: fstate[s[0]] = True
         elif key == 'N':
@@ -983,8 +1033,12 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
             clean_content = False
             output_cap = 8
             cap_idx = CAP_STEPS.index(8)
-            msg_cap = 0
-            msg_idx = MSG_CAP_STEPS.index(0)
+            user_cap = 0
+            u_idx = 0
+            agent_cap = 0
+            a_idx = 0
+            reason_cap = 0
+            r_idx = 0
         elif key == 'Q' or key == 'ESC':
             break
         elif key.isdigit():
@@ -997,7 +1051,7 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
                     for s in SECTION_DEFS: fstate[s[0]] = s[0] in pkeys
                 clean_content = pclean
 
-    return fstate, clean_content, output_cap, msg_cap
+    return fstate, clean_content, output_cap, user_cap, agent_cap, reason_cap
 
 # ──────────────────────────────────────────────────────────────
 # Session List & Main Loop
@@ -1127,7 +1181,7 @@ def process_conversion(indices_str: str, files: List[Path]):
         return
 
     # Interactive filter
-    section_filter, clean_content, output_cap, msg_cap = interactive_filter(parsers)
+    section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap = interactive_filter(parsers)
 
     # Check anything is selected
     if not any(section_filter.values()):
@@ -1164,7 +1218,9 @@ def process_conversion(indices_str: str, files: List[Path]):
                 section_filter=section_filter,
                 clean_content=clean_content,
                 output_cap=output_cap,
-                msg_cap=msg_cap,
+                user_cap=user_cap,
+                agent_cap=agent_cap,
+                reasoning_cap=reason_cap,
             )
 
             date_prefix = datetime.fromtimestamp(
