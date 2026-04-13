@@ -87,7 +87,7 @@ python codex-md.py
 
 ## 📈 Activity & Growth
 
-[![Star History Chart](https://api.star-history.com/svg?repos=mexenon/codex-session-export&type=Date&v=2)](https://star-history.com/#mexenon/codex-session-export&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=mexenon/codex-session-export&type=Date&theme=dark)](https://star-history.com/#mexenon/codex-session-export&Date)
 
 ---
 
