@@ -824,7 +824,7 @@ def read_key() -> str:
 OUTPUT_SECTIONS = {'terminal_output', 'mcp_tool_output', 'other_tool_output', 'custom_tool_output'}
 # Cap steps for ◀ ▶ control  (0 = no cap, show all)
 CAP_STEPS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30, 50, 100, 200, 500]
-MSG_CAP_STEPS = [0, 5, 10, 20, 50] + list(range(70, 511, 20))
+MSG_CAP_STEPS = [0, 5] + list(range(10, 101, 10)) + [150, 200, 300, 500]
 
 def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], bool, int, int, int, int]:
     """
