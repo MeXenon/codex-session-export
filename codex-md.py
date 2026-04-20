@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Codex Session Manager & Markdown Converter  (v2)
+Codex Session Manager & Markdown Converter  (v2.4.0)
 -------------------------------------------------
 An interactive tool to browse, filter, and convert OpenAI Codex
 session logs (.jsonl) into readable Markdown documents.
@@ -638,6 +638,26 @@ class SessionParser:
 
         return counts
 
+    # --- turn boundaries ---
+    def get_turn_boundaries(self) -> List[int]:
+        """Return indices in self.data where each turn starts (at each user_message)."""
+        return [i for i, item in enumerate(self.data) if item['type'] == 'user_message']
+
+    def get_turn_count(self) -> int:
+        """Return the number of turns (user messages) in this session."""
+        return len(self.get_turn_boundaries())
+
+    def trim_to_last_n_turns(self, n: int):
+        """Keep only the last N turns worth of data items.
+        A turn starts at a user_message and includes everything until the next one."""
+        if n <= 0:
+            return
+        boundaries = self.get_turn_boundaries()
+        if not boundaries or n >= len(boundaries):
+            return
+        cut_index = boundaries[-n]
+        self.data = self.data[cut_index:]
+
     # --- markdown rendering with filter ---
     def to_markdown(self, section_filter: Optional[Dict[str, bool]] = None,
                     clean_content: bool = False, output_cap: int = 0, user_cap: int = 0, agent_cap: int = 0, reasoning_cap: int = 0, internal_cap: int = 0) -> str:
@@ -829,7 +849,7 @@ OUTPUT_SECTIONS = {'terminal_output', 'mcp_tool_output', 'other_tool_output', 'c
 CAP_STEPS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30, 50, 100, 200, 500]
 MSG_CAP_STEPS = [0, 5] + list(range(10, 101, 10)) + [150, 200, 300, 500]
 
-def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], bool, int, int, int, int]:
+def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> Tuple[Dict[str, bool], bool, int, int, int, int]:
     """
     Full-screen interactive filter.
     Returns (section_filter, clean_content, output_cap, user_cap, agent_cap, reasoning_cap, internal_cap).
@@ -947,6 +967,8 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
         # ── Render ──
         _clear_screen()
         sessions_label = f"{len(parsers)} session{'s' if len(parsers) > 1 else ''}"
+        if scope_label:
+            sessions_label += f" · {scope_label}"
         print(f"\n  {Style.BOLD}{Style.HEADER}SECTION FILTER{Style.RESET}  {Style.DIM}({sessions_label}){Style.RESET}")
         print(f"  {Style.DIM}{'━' * 62}{Style.RESET}\n")
 
@@ -1115,6 +1137,43 @@ def interactive_filter(parsers: List[SessionParser]) -> Tuple[Dict[str, bool], b
     return fstate, clean_content, output_cap, user_cap, agent_cap, reason_cap, internal_cap
 
 # ──────────────────────────────────────────────────────────────
+# Extraction Scope (Last N Turns)
+# ──────────────────────────────────────────────────────────────
+def select_extraction_scope(parsers: List[SessionParser]) -> int:
+    """
+    Ask user for extraction scope before entering the section filter.
+    Returns 0 for full session, or N for last N turns.
+    """
+    _clear_screen()
+    print(f"\n  {Style.BOLD}{Style.HEADER}EXTRACTION SCOPE{Style.RESET}\n")
+    print(f"  {Style.DIM}{'━' * 52}{Style.RESET}\n")
+
+    for i, p in enumerate(parsers):
+        tc = p.get_turn_count()
+        label = f"Session {i+1}" if len(parsers) > 1 else "Session"
+        title = p.title
+        if len(title) > 42:
+            title = title[:39] + "..."
+        print(f"  {Style.CYAN}{label}{Style.RESET}  {Style.DIM}{title}{Style.RESET}")
+        print(f"           {Style.BOLD}{tc}{Style.RESET} turn{'s' if tc != 1 else ''}\n")
+
+    print(f"  {Style.DIM}{'━' * 52}{Style.RESET}")
+    print(f"  {Style.DIM}A 'turn' = one user message + all agent work that followed.{Style.RESET}\n")
+    print(f"    {Style.GREEN}[F]{Style.RESET} Full Session — export every turn  {Style.DIM}(Default){Style.RESET}")
+    print(f"    {Style.YELLOW}[L]{Style.RESET} Last N Turns — only the most recent N turns\n")
+
+    choice = input(f"  {Style.BOLD}Select > {Style.RESET}").strip().lower()
+
+    if choice == 'l':
+        while True:
+            n_str = input(f"  {Style.BOLD}How many recent turns? > {Style.RESET}").strip()
+            if n_str.isdigit() and int(n_str) > 0:
+                return int(n_str)
+            print(f"  {Style.error('Enter a positive number.')}")
+
+    return 0  # Full session
+
+# ──────────────────────────────────────────────────────────────
 # Session List & Main Loop
 # ──────────────────────────────────────────────────────────────
 def get_all_sessions() -> List[Path]:
@@ -1132,7 +1191,7 @@ def get_all_sessions() -> List[Path]:
 
 def print_menu_header():
     os.system('cls' if os.name == 'nt' else 'clear')
-    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2{Style.RESET}")
+    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.4.0{Style.RESET}")
     print(f"{Style.DIM}Directory: {SESSIONS_DIR}{Style.RESET}")
     print(f"{Style.DIM}Output:    {Path(__file__).parent.resolve()}{Style.RESET}\n")
 
@@ -1241,8 +1300,15 @@ def process_conversion(indices_str: str, files: List[Path]):
     if not parsers:
         return
 
+    # Extraction scope (Last N Turns)
+    turn_limit = select_extraction_scope(parsers)
+    if turn_limit > 0:
+        for p in parsers:
+            p.trim_to_last_n_turns(turn_limit)
+
     # Interactive filter
-    section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap, internal_cap = interactive_filter(parsers)
+    scope_label = f"last {turn_limit} turn{'s' if turn_limit != 1 else ''}" if turn_limit > 0 else ""
+    section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap, internal_cap = interactive_filter(parsers, scope_label=scope_label)
 
     # Check anything is selected
     if not any(section_filter.values()):
