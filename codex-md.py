@@ -341,6 +341,8 @@ class SessionParser:
         self.metadata: Dict = {}
         self.title = "Untitled Session"
         self.start_time = None
+        self.latest_input_tokens = 0
+        self.model_context_window = 0
         self._load()
 
     # --- loading ---
@@ -426,7 +428,12 @@ class SessionParser:
                     parts.append(f"secondary {sec.get('used_percent', '?')}%")
             info = payload.get('info')
             if info and isinstance(info, dict):
-                parts.append(f"in={info.get('input_tokens', '?')}, out={info.get('output_tokens', '?')}")
+                usage = info.get('last_token_usage') or info.get('total_token_usage') or info
+                if 'input_tokens' in usage:
+                    self.latest_input_tokens = usage['input_tokens']
+                if 'model_context_window' in info:
+                    self.model_context_window = info['model_context_window']
+                parts.append(f"in={usage.get('input_tokens', '?')}, out={usage.get('output_tokens', '?')}")
             content = ', '.join(parts) if parts else 'token count event'
             self.data.append({
                 'type': 'token_count', 'timestamp': ts,
@@ -439,7 +446,9 @@ class SessionParser:
             detail = ''
             if ptype == 'task_started':
                 model = payload.get('collaboration_mode_kind', '')
-                ctx = payload.get('model_context_window', '')
+                ctx = payload.get('model_context_window', 0)
+                if ctx:
+                    self.model_context_window = ctx
                 if model or ctx:
                     detail = f" ({model}, ctx={ctx:,})" if ctx else f" ({model})"
             self.data.append({
@@ -452,8 +461,10 @@ class SessionParser:
         # 7 ─ Context compacted / thread rolled back / turn aborted / item completed
         if etype == 'event_msg' and ptype in ('context_compacted', 'thread_rolled_back', 'turn_aborted', 'item_completed'):
             detail = ''
+            num_turns = 0
             if ptype == 'thread_rolled_back':
-                detail = f" ({payload.get('num_turns', '?')} turns)"
+                num_turns = payload.get('num_turns', 0)
+                detail = f" ({num_turns} turns)"
             elif ptype == 'turn_aborted':
                 detail = f" (reason: {payload.get('reason', '?')})"
             elif ptype == 'item_completed':
@@ -463,6 +474,7 @@ class SessionParser:
                 'type': 'session_event', 'timestamp': ts,
                 'event': ptype,
                 'content': ptype.replace('_', ' ').title() + detail,
+                'num_turns': num_turns,
             })
             return
 
@@ -472,6 +484,7 @@ class SessionParser:
                 'type': 'session_event', 'timestamp': ts,
                 'event': 'context_compacted',
                 'content': 'Context Compacted',
+                'replacement_history': payload.get('replacement_history', [])
             })
             return
 
@@ -600,6 +613,8 @@ class SessionParser:
         for item in self.data:
             itype = item['type']
             content = item.get('content', '')
+            if isinstance(content, list): content = '\n'.join(str(x) for x in content)
+            elif not isinstance(content, str): content = str(content)
 
             if itype == 'user_message':
                 lines = content.count('\n') + 4
@@ -611,13 +626,17 @@ class SessionParser:
                 lines = 2 if not content else content.count('\n') + 3
             elif itype in tool_call_types:
                 args = item.get('arguments', '')
-                try:
-                    args = json.dumps(json.loads(args), indent=2)
-                except Exception:
-                    pass
+                if isinstance(args, (dict, list)):
+                    try: args = json.dumps(args, indent=2)
+                    except Exception: args = str(args)
+                else:
+                    try: args = json.dumps(json.loads(args), indent=2)
+                    except Exception: args = str(args)
                 lines = args.count('\n') + 5
             elif itype in tool_output_types:
                 out = item.get('output', '')
+                if isinstance(out, list): out = '\n'.join(str(x) for x in out)
+                elif not isinstance(out, str): out = str(out)
                 lines = out.count('\n') + 5 if out.strip() else 0
             elif itype == 'custom_tool_call':
                 lines = content.count('\n') + 5
@@ -657,6 +676,63 @@ class SessionParser:
             return
         cut_index = boundaries[-n]
         self.data = self.data[cut_index:]
+
+    def trim_to_live_context(self):
+        """
+        Replicate Codex's live context logic.
+        - Compactions clear older history and replace it with their replacement_history.
+        - Rollbacks drop the last N user turns and everything that follows.
+        """
+        live_data = []
+        for item in self.data:
+            if item['type'] == 'session_event' and item.get('event') == 'thread_rolled_back':
+                num_turns = item.get('num_turns', 0)
+                if num_turns > 0:
+                    user_msg_indices = [i for i, x in enumerate(live_data) if x['type'] == 'user_message']
+                    if user_msg_indices:
+                        cut_idx = user_msg_indices[-num_turns] if num_turns <= len(user_msg_indices) else 0
+                        live_data = live_data[:cut_idx]
+                live_data.append(item)
+            elif item['type'] == 'session_event' and item.get('event') == 'context_compacted':
+                repl_history = item.get('replacement_history', [])
+                if repl_history:
+                    parsed_repl = self._parse_replacement_history(repl_history)
+                    # Replace older history with the compacted history
+                    live_data = parsed_repl + [item]
+                else:
+                    # If it's a legacy compaction without history, just append the marker
+                    live_data.append(item)
+            else:
+                live_data.append(item)
+        self.data = live_data
+
+    def _parse_replacement_history(self, repl_history) -> List[Dict]:
+        parsed = []
+        for repl_item in repl_history:
+            ptype = repl_item.get('type', '')
+            role = repl_item.get('role', '')
+            content = repl_item.get('content', [])
+            
+            # Helper to extract text from content array or string
+            def extract_text(c):
+                if isinstance(c, list):
+                    return '\n'.join(p.get('text', '') for p in c if p.get('type') == 'input_text')
+                return str(c)
+
+            if ptype == 'message' and role == 'user':
+                msg = extract_text(content)
+                if msg: parsed.append({'type': 'user_message', 'timestamp': '', 'content': msg})
+            elif ptype == 'message' and role == 'assistant':
+                msg = extract_text(content)
+                if msg: parsed.append({'type': 'agent_message', 'timestamp': '', 'content': msg})
+            elif ptype == 'message' and role == 'developer':
+                msg = extract_text(content)
+                if msg: parsed.append({'type': 'system_message', 'timestamp': '', 'content': msg})
+            elif ptype == 'reasoning':
+                parts = repl_item.get('summary', [])
+                summary = '\n'.join(p.get('text', '') for p in parts if p.get('text', ''))
+                parsed.append({'type': 'reasoning', 'timestamp': '', 'content': summary, 'encrypted': bool(repl_item.get('encrypted_content'))})
+        return parsed
 
     # --- markdown rendering with filter ---
     def to_markdown(self, section_filter: Optional[Dict[str, bool]] = None,
@@ -713,6 +789,8 @@ class SessionParser:
                 continue
 
             content = item.get('content', '')
+            if isinstance(content, list): content = '\n'.join(str(x) for x in content)
+            elif not isinstance(content, str): content = str(content)
 
             if itype == 'user_message':
                 if clean_content:
@@ -746,16 +824,23 @@ class SessionParser:
                 name = item.get('name', 'tool')
                 args = item.get('arguments', '')
                 try:
-                    args = json.dumps(json.loads(args), indent=2)
+                    if isinstance(args, (dict, list)):
+                        args = json.dumps(args, indent=2)
+                    else:
+                        args = json.dumps(json.loads(args), indent=2)
                     lang = "json"
                 except Exception:
+                    args = str(args)
                     lang = "text"
                 emoji_map = {'terminal_cmd': '💻', 'mcp_tool': '🔌', 'other_tool': '🧩'}
                 em = emoji_map.get(itype, '🛠️')
                 md.append(f"### {em} Tool: `{name}`\n\n```{lang}\n{args}\n```\n")
 
             elif itype in ('terminal_output', 'mcp_tool_output', 'other_tool_output'):
-                out = _cap_text(item.get('output', ''))
+                out = item.get('output', '')
+                if isinstance(out, list): out = '\n'.join(str(x) for x in out)
+                elif not isinstance(out, str): out = str(out)
+                out = _cap_text(out)
                 if out.strip():
                     md.append(f"**Output:**\n\n```text\n{out}\n```\n")
 
@@ -889,6 +974,8 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
                 if i not in keep_indices: continue
                 itype = item['type']
                 content = item.get('content', '')
+                if isinstance(content, list): content = '\n'.join(str(x) for x in content)
+                elif not isinstance(content, str): content = str(content)
                 
                 # Count actual messages for chat-type sections
                 if itype in ('user_message', 'agent_message', 'agent_reasoning', 'reasoning'):
@@ -904,9 +991,17 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
                     lines = 2 if not content else content.count('\n') + 3
                 elif itype in tool_call_types:
                     args = item.get('arguments', '')
+                    if isinstance(args, (dict, list)):
+                        try: args = json.dumps(args, indent=2)
+                        except Exception: args = str(args)
+                    else:
+                        try: args = json.dumps(json.loads(args), indent=2)
+                        except Exception: args = str(args)
                     lines = args.count('\n') + 5
                 elif itype in tool_output_types:
                     out = item.get('output', '')
+                    if isinstance(out, list): out = '\n'.join(str(x) for x in out)
+                    elif not isinstance(out, str): out = str(out)
                     total_out = out.count('\n') + 1 if out.strip() else 0
                     if cap_out > 0: lines = min(total_out, cap_out) + 4 if total_out > 0 else 0
                     else: lines = total_out + 4 if total_out > 0 else 0
@@ -1139,10 +1234,10 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
 # ──────────────────────────────────────────────────────────────
 # Extraction Scope (Last N Turns)
 # ──────────────────────────────────────────────────────────────
-def select_extraction_scope(parsers: List[SessionParser]) -> int:
+def select_extraction_scope(parsers: List[SessionParser]) -> Tuple[str, int]:
     """
     Ask user for extraction scope before entering the section filter.
-    Returns 0 for full session, or N for last N turns.
+    Returns ('full', 0) for full session, ('last_n', N) for last N turns, or ('live', 0) for Live Context.
     """
     _clear_screen()
     print(f"\n  {Style.BOLD}{Style.HEADER}EXTRACTION SCOPE{Style.RESET}\n")
@@ -1155,23 +1250,32 @@ def select_extraction_scope(parsers: List[SessionParser]) -> int:
         if len(title) > 42:
             title = title[:39] + "..."
         print(f"  {Style.CYAN}{label}{Style.RESET}  {Style.DIM}{title}{Style.RESET}")
-        print(f"           {Style.BOLD}{tc}{Style.RESET} turn{'s' if tc != 1 else ''}\n")
+        
+        ctx_str = ""
+        if p.model_context_window > 0:
+            pct = (p.latest_input_tokens / p.model_context_window) * 100
+            ctx_str = f"  {Style.DIM}Live Context: {p.latest_input_tokens//1000}k/{p.model_context_window//1000}k tokens ({pct:.1f}%){Style.RESET}"
+            
+        print(f"           {Style.BOLD}{tc}{Style.RESET} turn{'s' if tc != 1 else ''}{ctx_str}\n")
 
     print(f"  {Style.DIM}{'━' * 52}{Style.RESET}")
     print(f"  {Style.DIM}A 'turn' = one user message + all agent work that followed.{Style.RESET}\n")
     print(f"    {Style.GREEN}[F]{Style.RESET} Full Session — export every turn  {Style.DIM}(Default){Style.RESET}")
-    print(f"    {Style.YELLOW}[L]{Style.RESET} Last N Turns — only the most recent N turns\n")
+    print(f"    {Style.YELLOW}[L]{Style.RESET} Last N Turns — only the most recent N turns")
+    print(f"    {Style.CYAN}[C]{Style.RESET} Live Context — exact context window (resolves rollbacks & compactions)\n")
 
     choice = input(f"  {Style.BOLD}Select > {Style.RESET}").strip().lower()
 
-    if choice == 'l':
+    if choice == 'c':
+        return 'live', 0
+    elif choice == 'l':
         while True:
             n_str = input(f"  {Style.BOLD}How many recent turns? > {Style.RESET}").strip()
             if n_str.isdigit() and int(n_str) > 0:
-                return int(n_str)
+                return 'last_n', int(n_str)
             print(f"  {Style.error('Enter a positive number.')}")
 
-    return 0  # Full session
+    return 'full', 0
 
 # ──────────────────────────────────────────────────────────────
 # Session List & Main Loop
@@ -1191,7 +1295,7 @@ def get_all_sessions() -> List[Path]:
 
 def print_menu_header():
     os.system('cls' if os.name == 'nt' else 'clear')
-    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.4.0{Style.RESET}")
+    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.5.0{Style.RESET}")
     print(f"{Style.DIM}Directory: {SESSIONS_DIR}{Style.RESET}")
     print(f"{Style.DIM}Output:    {Path(__file__).parent.resolve()}{Style.RESET}\n")
 
@@ -1300,14 +1404,17 @@ def process_conversion(indices_str: str, files: List[Path]):
     if not parsers:
         return
 
-    # Extraction scope (Last N Turns)
-    turn_limit = select_extraction_scope(parsers)
-    if turn_limit > 0:
+    # Extraction scope (Last N Turns / Live Context)
+    scope_type, turn_limit = select_extraction_scope(parsers)
+    scope_label = ""
+    if scope_type == 'last_n':
         for p in parsers:
             p.trim_to_last_n_turns(turn_limit)
-
-    # Interactive filter
-    scope_label = f"last {turn_limit} turn{'s' if turn_limit != 1 else ''}" if turn_limit > 0 else ""
+        scope_label = f"last {turn_limit} turn{'s' if turn_limit != 1 else ''}"
+    elif scope_type == 'live':
+        for p in parsers:
+            p.trim_to_live_context()
+        scope_label = "live context"
     section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap, internal_cap = interactive_filter(parsers, scope_label=scope_label)
 
     # Check anything is selected
