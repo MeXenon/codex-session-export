@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Codex Session Manager & Markdown Converter  (v2.4.0)
+Codex Session Manager & Markdown Converter  (v2.5.1)
 -------------------------------------------------
 An interactive tool to browse, filter, and convert OpenAI Codex
 session logs (.jsonl) into readable Markdown documents.
@@ -1053,181 +1053,193 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
     ROW_INTERNAL = len(SECTION_DEFS) + 5
     num_items = len(SECTION_DEFS) + 6
 
-    while True:
-        agg_lines, agg_msgs = get_lines_for_state(output_cap, user_cap, agent_cap, reason_cap, internal_cap, clean_content)
-        total_lines = sum(agg_lines.get(s[0], 0) for s in SECTION_DEFS)
-        selected_lines = sum(agg_lines.get(s[0], 0) for s in SECTION_DEFS if fstate.get(s[0], False))
-        pct = (selected_lines / total_lines * 100) if total_lines > 0 else 0
+    sys.stdout.write('\033[?25l')
+    sys.stdout.flush()
+    _clear_screen()
 
-        # ── Render ──
-        _clear_screen()
-        sessions_label = f"{len(parsers)} session{'s' if len(parsers) > 1 else ''}"
-        if scope_label:
-            sessions_label += f" · {scope_label}"
-        print(f"\n  {Style.BOLD}{Style.HEADER}SECTION FILTER{Style.RESET}  {Style.DIM}({sessions_label}){Style.RESET}")
-        print(f"  {Style.DIM}{'━' * 62}{Style.RESET}\n")
+    try:
+        while True:
+            agg_lines, agg_msgs = get_lines_for_state(output_cap, user_cap, agent_cap, reason_cap, internal_cap, clean_content)
+            total_lines = sum(agg_lines.get(s[0], 0) for s in SECTION_DEFS)
+            selected_lines = sum(agg_lines.get(s[0], 0) for s in SECTION_DEFS if fstate.get(s[0], False))
+            pct = (selected_lines / total_lines * 100) if total_lines > 0 else 0
 
-        for i, (key, name, emoji, _default) in enumerate(SECTION_DEFS):
-            is_cursor = (i == cursor)
-            is_on     = fstate.get(key, False)
-            lines     = agg_lines.get(key, 0)
-            
-            arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if is_cursor else ' '
-            toggle = f'{Style.GREEN}██{Style.RESET}' if is_on else f'{Style.DIM}░░{Style.RESET}'
-            
-            if is_cursor and is_on: nstyle = f'{Style.BOLD}{Style.GREEN}'
-            elif is_cursor and not is_on: nstyle = f'{Style.BOLD}{Style.RED}'
-            elif is_on: nstyle = ''
-            else: nstyle = Style.DIM
+            # ── Render ──
+            out = ['\033[H']
+            sessions_label = f"{len(parsers)} session{'s' if len(parsers) > 1 else ''}"
+            if scope_label:
+                sessions_label += f" · {scope_label}"
+            out.append(f"\n  {Style.BOLD}{Style.HEADER}SECTION FILTER{Style.RESET}  {Style.DIM}({sessions_label}){Style.RESET}")
+            out.append(f"  {Style.DIM}{'━' * 62}{Style.RESET}\n")
 
-            _MSG_COUNT_TYPES = {'user_message', 'agent_message', 'agent_reasoning', 'reasoning'}
-            msg_n = agg_msgs.get(key, 0)
-            if key in _MSG_COUNT_TYPES and msg_n > 0:
-                msg_label = f' {Style.DIM}({msg_n:,} Msg){Style.RESET}'
-            else:
-                msg_label = ''
+            for i, (key, name, emoji, _default) in enumerate(SECTION_DEFS):
+                is_cursor = (i == cursor)
+                is_on     = fstate.get(key, False)
+                lines     = agg_lines.get(key, 0)
+                
+                arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if is_cursor else ' '
+                toggle = f'{Style.GREEN}██{Style.RESET}' if is_on else f'{Style.DIM}░░{Style.RESET}'
+                
+                if is_cursor and is_on: nstyle = f'{Style.BOLD}{Style.GREEN}'
+                elif is_cursor and not is_on: nstyle = f'{Style.BOLD}{Style.RED}'
+                elif is_on: nstyle = ''
+                else: nstyle = Style.DIM
 
-            count_str = f'{Style.CYAN}{lines:>6,}{Style.RESET}' if is_on and lines > 0 else f'{Style.DIM}{lines:>6,}{Style.RESET}'
-            if lines == 0: count_str = f'{Style.DIM}     0{Style.RESET}'
-
-            visible_name = f'{emoji} {name}'
-            pad_len = max(1, 44 - len(visible_name))
-            dots = f'{Style.DIM}{"·" * pad_len}{Style.RESET}'
-
-            print(f'  {arrow} {toggle} {nstyle}{visible_name}{Style.RESET} {dots} {count_str}{msg_label}')
-
-        print(f'  {Style.DIM}{"─" * 62}{Style.RESET}')
-
-        # Clean Chat
-        cc_on    = clean_content
-        cc_cur   = (cursor == ROW_CLEAN)
-        cc_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if cc_cur else ' '
-        cc_tog   = f'{Style.GREEN}██{Style.RESET}' if cc_on else f'{Style.DIM}░░{Style.RESET}'
-        cc_st    = f'{Style.BOLD}' if cc_cur else Style.DIM
-        cc_val   = f'{Style.GREEN}ON {Style.RESET}' if cc_on else f'{Style.DIM}OFF{Style.RESET}'
-        chat_lines = agg_lines.get('user_message', 0) + agg_lines.get('agent_message', 0)
-        print(f'  {cc_arrow} {cc_tog} {cc_st}✂️  Clean Chat{Style.RESET} {Style.DIM}(strips IDE context from 👤🤖){Style.RESET}  {Style.DIM}{chat_lines:,}L{Style.RESET}  {cc_val}')
-
-        # Output Cap
-        cap_cur   = (cursor == ROW_CAP)
-        cap_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if cap_cur else ' '
-        cap_st    = f'{Style.BOLD}' if cap_cur else Style.DIM
-        cap_label = f'{Style.DIM}ALL{Style.RESET}' if output_cap == 0 else f'{Style.YELLOW}{output_cap}{Style.RESET}'
-        hint = f' {Style.DIM}◀▶{Style.RESET}' if cap_cur else ''
-        print(f'  {cap_arrow}    {cap_st}💻 Terminal Output Cap{Style.RESET} {Style.DIM}(max lines/block){Style.RESET}  {cap_label}{hint}')
-
-        # User Cap
-        u_cur   = (cursor == ROW_USER)
-        u_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if u_cur else ' '
-        u_st    = f'{Style.BOLD}' if u_cur else Style.DIM
-        u_label = f'{Style.DIM}ALL{Style.RESET}' if user_cap == 0 else f'{Style.YELLOW}Last {user_cap}{Style.RESET}'
-        u_hint = f' {Style.DIM}◀▶{Style.RESET}' if u_cur else ''
-        print(f'  {u_arrow}    {u_st}👤 User Message Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}             {u_label}{u_hint}')
-
-        # Agent Cap
-        a_cur   = (cursor == ROW_AGENT)
-        a_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if a_cur else ' '
-        a_st    = f'{Style.BOLD}' if a_cur else Style.DIM
-        a_label = f'{Style.DIM}ALL{Style.RESET}' if agent_cap == 0 else f'{Style.YELLOW}Last {agent_cap}{Style.RESET}'
-        a_hint = f' {Style.DIM}◀▶{Style.RESET}' if a_cur else ''
-        print(f'  {a_arrow}    {a_st}🤖 Agent Message Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}            {a_label}{a_hint}')
-
-        # Reason Cap
-        r_cur   = (cursor == ROW_REASON)
-        r_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if r_cur else ' '
-        r_st    = f'{Style.BOLD}' if r_cur else Style.DIM
-        r_label = f'{Style.DIM}ALL{Style.RESET}' if reason_cap == 0 else f'{Style.YELLOW}Last {reason_cap}{Style.RESET}'
-        r_hint = f' {Style.DIM}◀▶{Style.RESET}' if r_cur else ''
-        print(f'  {r_arrow}    {r_st}🧠 Agent Reasoning Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}          {r_label}{r_hint}')
-
-        # Internal Reasoning Cap
-        i_cur   = (cursor == ROW_INTERNAL)
-        i_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if i_cur else ' '
-        i_st    = f'{Style.BOLD}' if i_cur else Style.DIM
-        i_label = f'{Style.DIM}ALL{Style.RESET}' if internal_cap == 0 else f'{Style.YELLOW}Last {internal_cap}{Style.RESET}'
-        i_hint = f' {Style.DIM}◀▶{Style.RESET}' if i_cur else ''
-        print(f'  {i_arrow}    {i_st}🔒 Internal Reasoning Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}       {i_label}{i_hint}')
-
-        print(f'\n  {Style.DIM}{"━" * 62}{Style.RESET}')
-        bar_w = 30
-        filled = int(bar_w * pct / 100)
-        bar = f'{Style.GREEN}{"█" * filled}{Style.DIM}{"░" * (bar_w - filled)}{Style.RESET}'
-        sel_c = Style.GREEN if pct > 0 else Style.RED
-        print(f'  {bar}  {sel_c}{Style.BOLD}{selected_lines:,}{Style.RESET}{Style.DIM}/{Style.RESET}{total_lines:,}  {Style.DIM}({pct:.0f}%){Style.RESET}')
-        print(f'\n  {Style.DIM}↑↓ move  ⏎ toggle  ◀▶ cap  Q export  A all  N none  D defaults  1-7 presets{Style.RESET}')
-
-        key = read_key()
-
-        if key == 'UP': cursor = (cursor - 1) % num_items
-        elif key == 'DOWN': cursor = (cursor + 1) % num_items
-        elif key in ('ENTER', 'SPACE'):
-            if cursor < len(SECTION_DEFS):
-                skey = SECTION_DEFS[cursor][0]
-                fstate[skey] = not fstate[skey]
-            elif cursor == ROW_CLEAN:
-                clean_content = not clean_content
-        elif key == 'LEFT':
-            if cursor == ROW_CAP:
-                cap_idx = max(0, cap_idx - 1)
-                output_cap = CAP_STEPS[cap_idx]
-            elif cursor == ROW_USER:
-                u_idx = max(0, u_idx - 1)
-                user_cap = MSG_CAP_STEPS[u_idx]
-            elif cursor == ROW_AGENT:
-                a_idx = max(0, a_idx - 1)
-                agent_cap = MSG_CAP_STEPS[a_idx]
-            elif cursor == ROW_REASON:
-                r_idx = max(0, r_idx - 1)
-                reason_cap = MSG_CAP_STEPS[r_idx]
-            elif cursor == ROW_INTERNAL:
-                i_idx = max(0, i_idx - 1)
-                internal_cap = MSG_CAP_STEPS[i_idx]
-        elif key == 'RIGHT':
-            if cursor == ROW_CAP:
-                cap_idx = min(len(CAP_STEPS) - 1, cap_idx + 1)
-                output_cap = CAP_STEPS[cap_idx]
-            elif cursor == ROW_USER:
-                u_idx = min(len(MSG_CAP_STEPS) - 1, u_idx + 1)
-                user_cap = MSG_CAP_STEPS[u_idx]
-            elif cursor == ROW_AGENT:
-                a_idx = min(len(MSG_CAP_STEPS) - 1, a_idx + 1)
-                agent_cap = MSG_CAP_STEPS[a_idx]
-            elif cursor == ROW_REASON:
-                r_idx = min(len(MSG_CAP_STEPS) - 1, r_idx + 1)
-                reason_cap = MSG_CAP_STEPS[r_idx]
-            elif cursor == ROW_INTERNAL:
-                i_idx = min(len(MSG_CAP_STEPS) - 1, i_idx + 1)
-                internal_cap = MSG_CAP_STEPS[i_idx]
-        elif key == 'A':
-            for s in SECTION_DEFS: fstate[s[0]] = True
-        elif key == 'N':
-            for s in SECTION_DEFS: fstate[s[0]] = False
-        elif key == 'I':
-            for s in SECTION_DEFS: fstate[s[0]] = not fstate[s[0]]
-        elif key == 'D':
-            for s in SECTION_DEFS: fstate[s[0]] = s[3]
-            clean_content = False
-            output_cap = 8
-            cap_idx = CAP_STEPS.index(8)
-            user_cap = 0
-            u_idx = 0
-            agent_cap = 0
-            a_idx = 0
-            reason_cap = 0
-            r_idx = 0
-            internal_cap = 0
-            i_idx = 0
-        elif key == 'Q' or key == 'ESC':
-            break
-        elif key.isdigit():
-            pi = int(key) - 1
-            if 0 <= pi < len(FILTER_PRESETS):
-                _pname, pkeys, pclean = FILTER_PRESETS[pi]
-                if pkeys is None:
-                    for s in SECTION_DEFS: fstate[s[0]] = s[3]
+                _MSG_COUNT_TYPES = {'user_message', 'agent_message', 'agent_reasoning', 'reasoning'}
+                msg_n = agg_msgs.get(key, 0)
+                if key in _MSG_COUNT_TYPES and msg_n > 0:
+                    msg_label = f' {Style.DIM}({msg_n:,} Msg){Style.RESET}'
                 else:
-                    for s in SECTION_DEFS: fstate[s[0]] = s[0] in pkeys
-                clean_content = pclean
+                    msg_label = ''
+
+                count_str = f'{Style.CYAN}{lines:>6,}{Style.RESET}' if is_on and lines > 0 else f'{Style.DIM}{lines:>6,}{Style.RESET}'
+                if lines == 0: count_str = f'{Style.DIM}     0{Style.RESET}'
+
+                visible_name = f'{emoji} {name}'
+                pad_len = max(1, 44 - len(visible_name))
+                dots = f'{Style.DIM}{"·" * pad_len}{Style.RESET}'
+
+                out.append(f'  {arrow} {toggle} {nstyle}{visible_name}{Style.RESET} {dots} {count_str}{msg_label}')
+
+            out.append(f'  {Style.DIM}{"─" * 62}{Style.RESET}')
+
+            # Clean Chat
+            cc_on    = clean_content
+            cc_cur   = (cursor == ROW_CLEAN)
+            cc_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if cc_cur else ' '
+            cc_tog   = f'{Style.GREEN}██{Style.RESET}' if cc_on else f'{Style.DIM}░░{Style.RESET}'
+            cc_st    = f'{Style.BOLD}' if cc_cur else Style.DIM
+            cc_val   = f'{Style.GREEN}ON {Style.RESET}' if cc_on else f'{Style.DIM}OFF{Style.RESET}'
+            chat_lines = agg_lines.get('user_message', 0) + agg_lines.get('agent_message', 0)
+            out.append(f'  {cc_arrow} {cc_tog} {cc_st}✂️  Clean Chat{Style.RESET} {Style.DIM}(strips IDE context from 👤🤖){Style.RESET}  {Style.DIM}{chat_lines:,}L{Style.RESET}  {cc_val}')
+
+            # Output Cap
+            cap_cur   = (cursor == ROW_CAP)
+            cap_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if cap_cur else ' '
+            cap_st    = f'{Style.BOLD}' if cap_cur else Style.DIM
+            cap_label = f'{Style.DIM}ALL{Style.RESET}' if output_cap == 0 else f'{Style.YELLOW}{output_cap}{Style.RESET}'
+            hint = f' {Style.DIM}◀▶{Style.RESET}' if cap_cur else ''
+            out.append(f'  {cap_arrow}    {cap_st}💻 Terminal Output Cap{Style.RESET} {Style.DIM}(max lines/block){Style.RESET}  {cap_label}{hint}')
+
+            # User Cap
+            u_cur   = (cursor == ROW_USER)
+            u_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if u_cur else ' '
+            u_st    = f'{Style.BOLD}' if u_cur else Style.DIM
+            u_label = f'{Style.DIM}ALL{Style.RESET}' if user_cap == 0 else f'{Style.YELLOW}Last {user_cap}{Style.RESET}'
+            u_hint = f' {Style.DIM}◀▶{Style.RESET}' if u_cur else ''
+            out.append(f'  {u_arrow}    {u_st}👤 User Message Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}             {u_label}{u_hint}')
+
+            # Agent Cap
+            a_cur   = (cursor == ROW_AGENT)
+            a_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if a_cur else ' '
+            a_st    = f'{Style.BOLD}' if a_cur else Style.DIM
+            a_label = f'{Style.DIM}ALL{Style.RESET}' if agent_cap == 0 else f'{Style.YELLOW}Last {agent_cap}{Style.RESET}'
+            a_hint = f' {Style.DIM}◀▶{Style.RESET}' if a_cur else ''
+            out.append(f'  {a_arrow}    {a_st}🤖 Agent Message Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}            {a_label}{a_hint}')
+
+            # Reason Cap
+            r_cur   = (cursor == ROW_REASON)
+            r_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if r_cur else ' '
+            r_st    = f'{Style.BOLD}' if r_cur else Style.DIM
+            r_label = f'{Style.DIM}ALL{Style.RESET}' if reason_cap == 0 else f'{Style.YELLOW}Last {reason_cap}{Style.RESET}'
+            r_hint = f' {Style.DIM}◀▶{Style.RESET}' if r_cur else ''
+            out.append(f'  {r_arrow}    {r_st}🧠 Agent Reasoning Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}          {r_label}{r_hint}')
+
+            # Internal Reasoning Cap
+            i_cur   = (cursor == ROW_INTERNAL)
+            i_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if i_cur else ' '
+            i_st    = f'{Style.BOLD}' if i_cur else Style.DIM
+            i_label = f'{Style.DIM}ALL{Style.RESET}' if internal_cap == 0 else f'{Style.YELLOW}Last {internal_cap}{Style.RESET}'
+            i_hint = f' {Style.DIM}◀▶{Style.RESET}' if i_cur else ''
+            out.append(f'  {i_arrow}    {i_st}🔒 Internal Reasoning Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}       {i_label}{i_hint}')
+
+            out.append(f'\n  {Style.DIM}{"━" * 62}{Style.RESET}')
+            bar_w = 30
+            filled = int(bar_w * pct / 100)
+            bar = f'{Style.GREEN}{"█" * filled}{Style.DIM}{"░" * (bar_w - filled)}{Style.RESET}'
+            sel_c = Style.GREEN if pct > 0 else Style.RED
+            out.append(f'  {bar}  {sel_c}{Style.BOLD}{selected_lines:,}{Style.RESET}{Style.DIM}/{Style.RESET}{total_lines:,}  {Style.DIM}({pct:.0f}%){Style.RESET}')
+            out.append(f'\n  {Style.DIM}↑↓ move  ⏎ toggle  ◀▶ cap  Q export  A all  N none  D defaults  1-7 presets{Style.RESET}')
+            out.append('\033[J')
+
+            sys.stdout.write('\n'.join(out) + '\n')
+            sys.stdout.flush()
+
+            key = read_key()
+
+            if key == 'UP': cursor = (cursor - 1) % num_items
+            elif key == 'DOWN': cursor = (cursor + 1) % num_items
+            elif key in ('ENTER', 'SPACE'):
+                if cursor < len(SECTION_DEFS):
+                    skey = SECTION_DEFS[cursor][0]
+                    fstate[skey] = not fstate[skey]
+                elif cursor == ROW_CLEAN:
+                    clean_content = not clean_content
+            elif key == 'LEFT':
+                if cursor == ROW_CAP:
+                    cap_idx = max(0, cap_idx - 1)
+                    output_cap = CAP_STEPS[cap_idx]
+                elif cursor == ROW_USER:
+                    u_idx = max(0, u_idx - 1)
+                    user_cap = MSG_CAP_STEPS[u_idx]
+                elif cursor == ROW_AGENT:
+                    a_idx = max(0, a_idx - 1)
+                    agent_cap = MSG_CAP_STEPS[a_idx]
+                elif cursor == ROW_REASON:
+                    r_idx = max(0, r_idx - 1)
+                    reason_cap = MSG_CAP_STEPS[r_idx]
+                elif cursor == ROW_INTERNAL:
+                    i_idx = max(0, i_idx - 1)
+                    internal_cap = MSG_CAP_STEPS[i_idx]
+            elif key == 'RIGHT':
+                if cursor == ROW_CAP:
+                    cap_idx = min(len(CAP_STEPS) - 1, cap_idx + 1)
+                    output_cap = CAP_STEPS[cap_idx]
+                elif cursor == ROW_USER:
+                    u_idx = min(len(MSG_CAP_STEPS) - 1, u_idx + 1)
+                    user_cap = MSG_CAP_STEPS[u_idx]
+                elif cursor == ROW_AGENT:
+                    a_idx = min(len(MSG_CAP_STEPS) - 1, a_idx + 1)
+                    agent_cap = MSG_CAP_STEPS[a_idx]
+                elif cursor == ROW_REASON:
+                    r_idx = min(len(MSG_CAP_STEPS) - 1, r_idx + 1)
+                    reason_cap = MSG_CAP_STEPS[r_idx]
+                elif cursor == ROW_INTERNAL:
+                    i_idx = min(len(MSG_CAP_STEPS) - 1, i_idx + 1)
+                    internal_cap = MSG_CAP_STEPS[i_idx]
+            elif key == 'A':
+                for s in SECTION_DEFS: fstate[s[0]] = True
+            elif key == 'N':
+                for s in SECTION_DEFS: fstate[s[0]] = False
+            elif key == 'I':
+                for s in SECTION_DEFS: fstate[s[0]] = not fstate[s[0]]
+            elif key == 'D':
+                for s in SECTION_DEFS: fstate[s[0]] = s[3]
+                clean_content = False
+                output_cap = 8
+                cap_idx = CAP_STEPS.index(8)
+                user_cap = 0
+                u_idx = 0
+                agent_cap = 0
+                a_idx = 0
+                reason_cap = 0
+                r_idx = 0
+                internal_cap = 0
+                i_idx = 0
+            elif key == 'Q' or key == 'ESC':
+                break
+            elif key.isdigit():
+                pi = int(key) - 1
+                if 0 <= pi < len(FILTER_PRESETS):
+                    _pname, pkeys, pclean = FILTER_PRESETS[pi]
+                    if pkeys is None:
+                        for s in SECTION_DEFS: fstate[s[0]] = s[3]
+                    else:
+                        for s in SECTION_DEFS: fstate[s[0]] = s[0] in pkeys
+                    clean_content = pclean
+    finally:
+        sys.stdout.write('\033[?25h')
+        sys.stdout.flush()
 
     return fstate, clean_content, output_cap, user_cap, agent_cap, reason_cap, internal_cap
 
@@ -1295,7 +1307,7 @@ def get_all_sessions() -> List[Path]:
 
 def print_menu_header():
     os.system('cls' if os.name == 'nt' else 'clear')
-    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.5.0{Style.RESET}")
+    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.5.1{Style.RESET}")
     print(f"{Style.DIM}Directory: {SESSIONS_DIR}{Style.RESET}")
     print(f"{Style.DIM}Output:    {Path(__file__).parent.resolve()}{Style.RESET}\n")
 
