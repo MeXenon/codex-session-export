@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Codex Session Manager & Markdown Converter  (v2.5.1)
+Codex Session Manager & Markdown Converter  (v2.5.2)
 -------------------------------------------------
 An interactive tool to browse, filter, and convert OpenAI Codex
 session logs (.jsonl) into readable Markdown documents.
@@ -1053,9 +1053,17 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
     ROW_INTERNAL = len(SECTION_DEFS) + 5
     num_items = len(SECTION_DEFS) + 6
 
-    sys.stdout.write('\033[?25l')
+    import shutil as _shutil
+
+    # Alternate screen buffer (htop/vim/less style) — keeps the filter UI off
+    # the terminal's scrollback so it can't accumulate frames there. We combine
+    # that with an INTERNAL viewport: when the filter has more rows than the
+    # terminal can show, we render only the slice around the cursor and surface
+    # ▲/▼ markers so you always know there's more.
+    sys.stdout.write('\033[?1049h\033[?25l\033[H\033[2J')
     sys.stdout.flush()
-    _clear_screen()
+
+    scroll_offset = 0
 
     try:
         while True:
@@ -1064,13 +1072,9 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
             selected_lines = sum(agg_lines.get(s[0], 0) for s in SECTION_DEFS if fstate.get(s[0], False))
             pct = (selected_lines / total_lines * 100) if total_lines > 0 else 0
 
-            # ── Render ──
-            out = ['\033[H']
-            sessions_label = f"{len(parsers)} session{'s' if len(parsers) > 1 else ''}"
-            if scope_label:
-                sessions_label += f" · {scope_label}"
-            out.append(f"\n  {Style.BOLD}{Style.HEADER}SECTION FILTER{Style.RESET}  {Style.DIM}({sessions_label}){Style.RESET}")
-            out.append(f"  {Style.DIM}{'━' * 62}{Style.RESET}\n")
+            # ── Build the LIST of navigable / decorative middle rows ──
+            # Each entry is (cursor_id_or_None, rendered_text).
+            mid_rows: List[Tuple[Optional[int], str]] = []
 
             for i, (key, name, emoji, _default) in enumerate(SECTION_DEFS):
                 is_cursor = (i == cursor)
@@ -1099,9 +1103,9 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
                 pad_len = max(1, 44 - len(visible_name))
                 dots = f'{Style.DIM}{"·" * pad_len}{Style.RESET}'
 
-                out.append(f'  {arrow} {toggle} {nstyle}{visible_name}{Style.RESET} {dots} {count_str}{msg_label}')
+                mid_rows.append((i, f'  {arrow} {toggle} {nstyle}{visible_name}{Style.RESET} {dots} {count_str}{msg_label}'))
 
-            out.append(f'  {Style.DIM}{"─" * 62}{Style.RESET}')
+            mid_rows.append((None, f'  {Style.DIM}{"─" * 62}{Style.RESET}'))
 
             # Clean Chat
             cc_on    = clean_content
@@ -1111,7 +1115,7 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
             cc_st    = f'{Style.BOLD}' if cc_cur else Style.DIM
             cc_val   = f'{Style.GREEN}ON {Style.RESET}' if cc_on else f'{Style.DIM}OFF{Style.RESET}'
             chat_lines = agg_lines.get('user_message', 0) + agg_lines.get('agent_message', 0)
-            out.append(f'  {cc_arrow} {cc_tog} {cc_st}✂️  Clean Chat{Style.RESET} {Style.DIM}(strips IDE context from 👤🤖){Style.RESET}  {Style.DIM}{chat_lines:,}L{Style.RESET}  {cc_val}')
+            mid_rows.append((ROW_CLEAN, f'  {cc_arrow} {cc_tog} {cc_st}✂️  Clean Chat{Style.RESET} {Style.DIM}(strips IDE context from 👤🤖){Style.RESET}  {Style.DIM}{chat_lines:,}L{Style.RESET}  {cc_val}'))
 
             # Output Cap
             cap_cur   = (cursor == ROW_CAP)
@@ -1119,7 +1123,7 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
             cap_st    = f'{Style.BOLD}' if cap_cur else Style.DIM
             cap_label = f'{Style.DIM}ALL{Style.RESET}' if output_cap == 0 else f'{Style.YELLOW}{output_cap}{Style.RESET}'
             hint = f' {Style.DIM}◀▶{Style.RESET}' if cap_cur else ''
-            out.append(f'  {cap_arrow}    {cap_st}💻 Terminal Output Cap{Style.RESET} {Style.DIM}(max lines/block){Style.RESET}  {cap_label}{hint}')
+            mid_rows.append((ROW_CAP, f'  {cap_arrow}    {cap_st}💻 Terminal Output Cap{Style.RESET} {Style.DIM}(max lines/block){Style.RESET}  {cap_label}{hint}'))
 
             # User Cap
             u_cur   = (cursor == ROW_USER)
@@ -1127,7 +1131,7 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
             u_st    = f'{Style.BOLD}' if u_cur else Style.DIM
             u_label = f'{Style.DIM}ALL{Style.RESET}' if user_cap == 0 else f'{Style.YELLOW}Last {user_cap}{Style.RESET}'
             u_hint = f' {Style.DIM}◀▶{Style.RESET}' if u_cur else ''
-            out.append(f'  {u_arrow}    {u_st}👤 User Message Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}             {u_label}{u_hint}')
+            mid_rows.append((ROW_USER, f'  {u_arrow}    {u_st}👤 User Message Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}             {u_label}{u_hint}'))
 
             # Agent Cap
             a_cur   = (cursor == ROW_AGENT)
@@ -1135,7 +1139,7 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
             a_st    = f'{Style.BOLD}' if a_cur else Style.DIM
             a_label = f'{Style.DIM}ALL{Style.RESET}' if agent_cap == 0 else f'{Style.YELLOW}Last {agent_cap}{Style.RESET}'
             a_hint = f' {Style.DIM}◀▶{Style.RESET}' if a_cur else ''
-            out.append(f'  {a_arrow}    {a_st}🤖 Agent Message Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}            {a_label}{a_hint}')
+            mid_rows.append((ROW_AGENT, f'  {a_arrow}    {a_st}🤖 Agent Message Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}            {a_label}{a_hint}'))
 
             # Reason Cap
             r_cur   = (cursor == ROW_REASON)
@@ -1143,7 +1147,7 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
             r_st    = f'{Style.BOLD}' if r_cur else Style.DIM
             r_label = f'{Style.DIM}ALL{Style.RESET}' if reason_cap == 0 else f'{Style.YELLOW}Last {reason_cap}{Style.RESET}'
             r_hint = f' {Style.DIM}◀▶{Style.RESET}' if r_cur else ''
-            out.append(f'  {r_arrow}    {r_st}🧠 Agent Reasoning Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}          {r_label}{r_hint}')
+            mid_rows.append((ROW_REASON, f'  {r_arrow}    {r_st}🧠 Agent Reasoning Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}          {r_label}{r_hint}'))
 
             # Internal Reasoning Cap
             i_cur   = (cursor == ROW_INTERNAL)
@@ -1151,18 +1155,64 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
             i_st    = f'{Style.BOLD}' if i_cur else Style.DIM
             i_label = f'{Style.DIM}ALL{Style.RESET}' if internal_cap == 0 else f'{Style.YELLOW}Last {internal_cap}{Style.RESET}'
             i_hint = f' {Style.DIM}◀▶{Style.RESET}' if i_cur else ''
-            out.append(f'  {i_arrow}    {i_st}🔒 Internal Reasoning Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}       {i_label}{i_hint}')
+            mid_rows.append((ROW_INTERNAL, f'  {i_arrow}    {i_st}🔒 Internal Reasoning Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}       {i_label}{i_hint}'))
 
-            out.append(f'\n  {Style.DIM}{"━" * 62}{Style.RESET}')
+            # ── Viewport math ──
+            term_size = _shutil.get_terminal_size((80, 30))
+            term_h = max(10, term_size.lines)
+            # Fixed-size header (3 lines: blank + title + separator) +
+            # fixed-size footer (separator + progress bar + hint + 1 cushion).
+            # Plus 2 lines reserved for ▲/▼ markers so the layout never jumps.
+            HEADER_LINES = 3
+            FOOTER_LINES = 5
+            INDICATOR_LINES = 2
+            view_h = max(5, term_h - HEADER_LINES - FOOTER_LINES - INDICATOR_LINES)
+
+            # Find cursor's index in mid_rows and scroll viewport so it's visible
+            cur_pos = next((idx for idx, (rid, _) in enumerate(mid_rows) if rid == cursor), 0)
+            if cur_pos < scroll_offset:
+                scroll_offset = cur_pos
+            elif cur_pos >= scroll_offset + view_h:
+                scroll_offset = cur_pos - view_h + 1
+            max_offset = max(0, len(mid_rows) - view_h)
+            scroll_offset = max(0, min(scroll_offset, max_offset))
+
+            # ── Compose frame ──
+            out = ['\033[H\033[2J']  # home + clear (alt-screen surface)
+            sessions_label = f"{len(parsers)} session{'s' if len(parsers) > 1 else ''}"
+            if scope_label:
+                sessions_label += f" · {scope_label}"
+            out.append(f"  {Style.BOLD}{Style.HEADER}SECTION FILTER{Style.RESET}  {Style.DIM}({sessions_label}){Style.RESET}")
+            out.append(f"  {Style.DIM}{'━' * 62}{Style.RESET}")
+            out.append('')
+
+            # ▲ indicator (always reserve the line — keeps row positions stable)
+            if scroll_offset > 0:
+                out.append(f'  {Style.DIM}▲ {scroll_offset} more above{Style.RESET}')
+            else:
+                out.append('')
+
+            # Viewport slice
+            for _rid, text in mid_rows[scroll_offset:scroll_offset + view_h]:
+                out.append(text)
+
+            # ▼ indicator
+            below = max(0, len(mid_rows) - (scroll_offset + view_h))
+            if below > 0:
+                out.append(f'  {Style.DIM}▼ {below} more below{Style.RESET}')
+            else:
+                out.append('')
+
+            # Footer: separator + progress + hint
+            out.append(f'  {Style.DIM}{"━" * 62}{Style.RESET}')
             bar_w = 30
             filled = int(bar_w * pct / 100)
             bar = f'{Style.GREEN}{"█" * filled}{Style.DIM}{"░" * (bar_w - filled)}{Style.RESET}'
             sel_c = Style.GREEN if pct > 0 else Style.RED
             out.append(f'  {bar}  {sel_c}{Style.BOLD}{selected_lines:,}{Style.RESET}{Style.DIM}/{Style.RESET}{total_lines:,}  {Style.DIM}({pct:.0f}%){Style.RESET}')
-            out.append(f'\n  {Style.DIM}↑↓ move  ⏎ toggle  ◀▶ cap  Q export  A all  N none  D defaults  1-7 presets{Style.RESET}')
-            out.append('\033[J')
+            out.append(f'  {Style.DIM}↑↓ move  ⏎ toggle  ◀▶ cap  Q export  A all  N none  D defaults  1-7 presets{Style.RESET}')
 
-            sys.stdout.write('\n'.join(out) + '\n')
+            sys.stdout.write('\n'.join(out))
             sys.stdout.flush()
 
             key = read_key()
@@ -1238,7 +1288,9 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
                         for s in SECTION_DEFS: fstate[s[0]] = s[0] in pkeys
                     clean_content = pclean
     finally:
-        sys.stdout.write('\033[?25h')
+        # Restore cursor and leave the alt screen. The terminal pops back to
+        # whatever was on the main screen before we entered.
+        sys.stdout.write('\033[?25h\033[?1049l')
         sys.stdout.flush()
 
     return fstate, clean_content, output_cap, user_cap, agent_cap, reason_cap, internal_cap
@@ -1307,7 +1359,7 @@ def get_all_sessions() -> List[Path]:
 
 def print_menu_header():
     os.system('cls' if os.name == 'nt' else 'clear')
-    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.5.1{Style.RESET}")
+    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.5.2{Style.RESET}")
     print(f"{Style.DIM}Directory: {SESSIONS_DIR}{Style.RESET}")
     print(f"{Style.DIM}Output:    {Path(__file__).parent.resolve()}{Style.RESET}\n")
 
