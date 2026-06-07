@@ -1,0 +1,9 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+
+# Backups & scratch
+*.bak
+
+# Local release helper — contains a personal access token, never commit
+create_release.py

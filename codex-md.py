@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Codex Session Manager & Markdown Converter  (v2.5.2)
+Codex Session Manager & Markdown Converter  (v2.6.0)
 -------------------------------------------------
 An interactive tool to browse, filter, and convert OpenAI Codex
 session logs (.jsonl) into readable Markdown documents.
 
 Features:
   • Browse all Codex sessions with preview
+  • Group & browse sessions by project (working directory)
+  • Paginated browser for large session/project histories
   • Interactive per-section filter with line counts
   • Toggle sections on/off with arrow keys
   • Presets for common export scenarios
@@ -1342,24 +1344,99 @@ def select_extraction_scope(parsers: List[SessionParser]) -> Tuple[str, int]:
     return 'full', 0
 
 # ──────────────────────────────────────────────────────────────
+# Project grouping helpers  (a "project" = the session's cwd)
+# ──────────────────────────────────────────────────────────────
+def project_key_from_cwd(cwd: Optional[str]) -> str:
+    """Normalized, comparable key for a project directory.
+
+    Handles Windows drive-letter case differences and trailing slashes so
+    that e.g. 'C:\\foo\\' and 'c:\\foo' map to the same project.
+    """
+    if not cwd or not isinstance(cwd, str):
+        return ""
+    cleaned = cwd.strip().rstrip('\\/')
+    if not cleaned:
+        return ""
+    return os.path.normcase(cleaned)
+
+def project_display_name(cwd: Optional[str]) -> str:
+    """Human-friendly project label (the final path component)."""
+    if not cwd or not isinstance(cwd, str):
+        return "(no project)"
+    cleaned = cwd.strip().rstrip('\\/')
+    if not cleaned:
+        return "(no project)"
+    base = os.path.basename(cleaned)
+    return base or cleaned
+
+
+# ──────────────────────────────────────────────────────────────
 # Session List & Main Loop
 # ──────────────────────────────────────────────────────────────
-def get_all_sessions() -> List[Path]:
+class SessionRecord:
+    """Lightweight metadata for one session, captured during the scan."""
+    __slots__ = ('path', 'mtime', 'cwd', 'pkey', 'pname')
+
+    def __init__(self, path: Path, mtime: float, cwd: Optional[str]):
+        self.path = path
+        self.mtime = mtime
+        self.cwd = cwd or ""
+        self.pkey = project_key_from_cwd(cwd)
+        self.pname = project_display_name(cwd)
+
+
+def scan_sessions() -> List[SessionRecord]:
+    """Scan the sessions directory once, returning interactive sessions
+    (newest first) with their project (cwd) captured.
+
+    This replaces the old get_all_sessions(): it does the same filtering but
+    also records each session's project so the caller can group/paginate
+    without re-reading every file."""
     if not SESSIONS_DIR.exists():
         return []
     pattern = str(SESSIONS_DIR / "**" / "rollout-*.jsonl")
     files = glob.glob(pattern, recursive=True)
-    session_files = []
+    records: List[SessionRecord] = []
     for f in files:
         path = Path(f)
         meta, _, saw_user_event = read_session_summary(path)
         if is_interactive_session_meta(meta) and saw_user_event:
-            session_files.append(path)
-    return sorted(session_files, key=os.path.getmtime, reverse=True)
+            cwd = meta.get('cwd') if isinstance(meta, dict) else None
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            records.append(SessionRecord(path, mtime, cwd))
+    records.sort(key=lambda r: r.mtime, reverse=True)
+    return records
+
+
+def group_by_project(records: List[SessionRecord]) -> List[Dict]:
+    """Group session records by project key.
+
+    Returns a list of project dicts {'pkey','pname','cwd','idxs'} ordered by
+    most-recent activity. 'idxs' are indices into the *records* list and stay
+    in newest-first order (records are pre-sorted)."""
+    groups: Dict[str, Dict] = {}
+    for i, r in enumerate(records):
+        key = r.pkey or "\x00none"
+        g = groups.get(key)
+        if g is None:
+            groups[key] = {
+                'pkey': key,
+                'pname': r.pname if r.pkey else "(no project)",
+                'cwd': r.cwd,
+                'idxs': [i],
+            }
+        else:
+            g['idxs'].append(i)
+    ordered = sorted(groups.values(),
+                     key=lambda g: records[g['idxs'][0]].mtime, reverse=True)
+    return ordered
 
 def print_menu_header():
     os.system('cls' if os.name == 'nt' else 'clear')
-    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.5.2{Style.RESET}")
+    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.6.0{Style.RESET}")
     print(f"{Style.DIM}Directory: {SESSIONS_DIR}{Style.RESET}")
     print(f"{Style.DIM}Output:    {Path(__file__).parent.resolve()}{Style.RESET}\n")
 
@@ -1379,45 +1456,142 @@ def format_relative_time(mtime: float) -> str:
     else:
         return f"({mins}m ago)"
 
-def list_sessions_table(files: List[Path]):
-    print(f"{Style.BOLD}{'ID':<4} {'DATE':<32} {'TITLE':<52} {'SIZE'}{Style.RESET}")
-    print(f"{Style.DIM}{'-'*100}{Style.RESET}")
+_TABLE_WIDTH = 104
+_ANSI_RE = re.compile(r'\033\[[0-9;]*m')
 
-    for idx, f in enumerate(files):
+def _visible_len(s: str) -> int:
+    """Length of a string ignoring ANSI escape sequences."""
+    return len(_ANSI_RE.sub('', s))
+
+def _pad_ansi(s: str, width: int) -> str:
+    """Right-pad a (possibly ANSI-colored) string to a visible width."""
+    pad = width - _visible_len(s)
+    return s + (" " * pad if pad > 0 else "")
+
+def _truncate(text: str, width: int) -> str:
+    """Truncate plain text to a visible width with an ellipsis."""
+    if len(text) > width:
+        return text[:max(0, width - 3)] + "..."
+    return text
+
+def render_session_table(page_recs: List['SessionRecord'], start_no: int = 1,
+                         global_latest: Optional[Path] = None,
+                         show_project: bool = False):
+    """Render one page of sessions, numbered locally from start_no."""
+    if show_project:
+        header = f"{'#':<4} {'DATE':<32} {'TITLE':<38} {'PROJECT':<16} {'SIZE'}"
+    else:
+        header = f"{'#':<4} {'DATE':<32} {'TITLE':<54} {'SIZE'}"
+    print(f"{Style.BOLD}{header}{Style.RESET}")
+    print(f"{Style.DIM}{'-' * _TABLE_WIDTH}{Style.RESET}")
+
+    for offset, rec in enumerate(page_recs):
+        no = start_no + offset
         try:
-            stat = f.stat()
-            dt_str = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
-            rel_str = format_relative_time(stat.st_mtime)
-            dt_full = f"{dt_str} {Style.DIM}{rel_str}{Style.RESET}"
+            size_label = format_size(rec.path.stat().st_size)
+        except OSError:
+            size_label = "?"
+        dt_str = datetime.fromtimestamp(rec.mtime).strftime("%Y-%m-%d %H:%M")
+        rel_str = format_relative_time(rec.mtime)
+        title = get_session_preview_title(rec.path)
 
-            size_label = format_size(stat.st_size)
-            title = get_session_preview_title(f)
+        is_latest = (global_latest is not None and rec.path == global_latest)
+        tag = " [LATEST]" if is_latest else ""
+        row_color = Style.GREEN if is_latest else (Style.CYAN if no % 2 == 0 else Style.RESET)
 
-            tag = ""
-            row_color = Style.RESET
-            if idx == 0:
-                tag = " [LATEST]"
-                row_color = Style.GREEN
-            elif idx < 3:
-                tag = " [NEW]"
-                row_color = Style.BLUE
-            elif idx % 2 == 0:
-                row_color = Style.CYAN
+        dt_cell = _pad_ansi(f"{dt_str} {Style.DIM}{rel_str}{Style.RESET}", 32)
 
-            display_title = f"{title}{tag}"
-            if len(display_title) > 50:
-                display_title = display_title[:47] + "..."
+        if show_project:
+            title_cell = _truncate(f"{title}{tag}", 38)
+            proj_cell = _truncate(rec.pname if rec.pkey else "(no project)", 16)
+            print(f"{row_color}{no:<4} {dt_cell} {title_cell:<38} {proj_cell:<16} {size_label}{Style.RESET}")
+        else:
+            title_cell = _truncate(f"{title}{tag}", 54)
+            print(f"{row_color}{no:<4} {dt_cell} {title_cell:<54} {size_label}{Style.RESET}")
+    print(f"{Style.DIM}{'-' * _TABLE_WIDTH}{Style.RESET}")
 
-            # We use ansi escape codes in dt_full, so padding with spaces in f-string 
-            # won't work correctly with fixed-width natively.
-            # So we pad the raw string length then apply colors.
-            raw_dt_len = len(f"{dt_str} {rel_str}")
-            padding = " " * max(0, 32 - raw_dt_len)
-            
-            print(f"{row_color}{idx+1:<4} {dt_full}{padding} {display_title:<52} {size_label}{Style.RESET}")
-        except Exception:
+def render_project_table(page_projs: List[Dict], records: List['SessionRecord'],
+                         start_no: int = 1):
+    """Render one page of projects, numbered locally from start_no."""
+    print(f"{Style.BOLD}{'#':<4} {'PROJECT':<26} {'SESSIONS':<12} {'LAST ACTIVE':<16} {'PATH'}{Style.RESET}")
+    print(f"{Style.DIM}{'-' * _TABLE_WIDTH}{Style.RESET}")
+    for offset, g in enumerate(page_projs):
+        no = start_no + offset
+        count = len(g['idxs'])
+        newest = records[g['idxs'][0]].mtime
+        rel = format_relative_time(newest)            # e.g. "(6h 17m ago)" (no ANSI)
+        name = _truncate(g['pname'], 26)
+        cwd = _truncate(g['cwd'] or "(unknown)", 42)
+        count_str = f"{count} session{'s' if count != 1 else ''}"
+        row_color = Style.CYAN if no % 2 == 0 else Style.RESET
+        print(f"{row_color}{no:<4} {name:<26} {count_str:<12} {rel:<16} {Style.DIM}{cwd}{Style.RESET}")
+    print(f"{Style.DIM}{'-' * _TABLE_WIDTH}{Style.RESET}")
+
+def _print_pager(page_idx: int, total_pages: int, total_items: int, noun: str):
+    print(f"\n{Style.DIM}Page {page_idx + 1}/{total_pages}  ·  {total_items} {noun} total{Style.RESET}")
+
+def _parse_row_selection(choice: str, page_paths: List[Path]) -> List[Path]:
+    """Map a user's comma list of row numbers (1-based, current page) to Paths."""
+    valid: List[Path] = []
+    seen: Set[Path] = set()
+    for part in (x.strip() for x in choice.split(',')):
+        if not part:
             continue
-    print(f"{Style.DIM}{'-'*100}{Style.RESET}")
+        if not part.isdigit():
+            print(Style.warn(f"Ignoring '{part}' — enter row numbers shown on this page."))
+            continue
+        n = int(part)
+        if 1 <= n <= len(page_paths):
+            p = page_paths[n - 1]
+            if p not in seen:
+                seen.add(p)
+                valid.append(p)
+        else:
+            print(Style.warn(f"Row {n} is not on this page (1-{len(page_paths)})."))
+    return valid
+
+
+def _read_browser_action(prompt: str):
+    """Render the prompt and read a single keypress for the browser.
+
+    Returns a (kind, value) tuple:
+      ('prev',   None)       ← / ↑ / p   — previous page
+      ('next',   None)       → / ↓ / n   — next page
+      ('select', "1, 3")     a digit was pressed; the full typed line follows
+      ('cmd',    'M')        a command letter (uppercased): M / B / A / Q ...
+      ('noop',   None)       Enter / Space / unrecognized
+
+    Navigation keys act on a single keypress (no Enter). Pressing a digit drops
+    into normal line input so multi-session selections like '1, 3, 5' still work.
+    """
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    try:
+        key = read_key()
+    except KeyboardInterrupt:
+        print()
+        return ('cmd', 'Q')
+    if key in ('LEFT', 'UP', 'P'):
+        print()
+        return ('prev', None)
+    if key in ('RIGHT', 'DOWN', 'N'):
+        print()
+        return ('next', None)
+    if key and key.isdigit():
+        # Selection mode: echo the first digit, then read the rest of the line.
+        sys.stdout.write(key)
+        sys.stdout.flush()
+        try:
+            rest = input()
+        except EOFError:
+            rest = ''
+        return ('select', key + rest)
+    if key in ('ENTER', 'SPACE', 'ESC', ''):
+        print()
+        return ('noop', None)
+    print()
+    return ('cmd', key)
+
 
 def copy_to_clipboard(text: str) -> bool:
     import subprocess
@@ -1435,24 +1609,11 @@ def copy_to_clipboard(text: str) -> bool:
     except Exception:
         return False
 
-def process_conversion(indices_str: str, files: List[Path]):
-    if not indices_str.strip():
-        return
+def convert_files(valid_files: List[Path]):
+    """Run the full extraction/filter/export flow for a set of session files.
 
-    try:
-        raw_parts = [x.strip() for x in indices_str.split(',')]
-        indices = [int(x) - 1 for x in raw_parts if x.isdigit()]
-    except ValueError:
-        print(Style.error("Invalid input format."))
-        return
-
-    valid_files: List[Path] = []
-    for idx in indices:
-        if 0 <= idx < len(files):
-            valid_files.append(files[idx])
-        else:
-            print(Style.warn(f"ID {idx+1} is out of range."))
-
+    Selection parsing now happens in the browser (interactive_loop); this
+    routine receives already-resolved Paths."""
     if not valid_files:
         return
 
@@ -1559,37 +1720,180 @@ def process_conversion(indices_str: str, files: List[Path]):
 
     input(f"\n{Style.DIM}Press Enter to return to menu...{Style.RESET}")
 
+SESSIONS_PER_PAGE = 12
+
+
 def interactive_loop():
+    """Paginated browser with two view modes:
+
+      • ALL SESSIONS  — flat, newest-first list (with a project column)
+      • PROJECTS      — sessions grouped by working directory; drill into one
+
+    Toggle with [m]. Page with ←/→ (or ↑/↓, or [n]/[p]). Sessions are scanned
+    once and reused. Navigation is single-keypress; type a number to select.
+    """
+    records = scan_sessions()
+    if not records:
+        print_menu_header()
+        print(Style.error(f"No sessions found in {SESSIONS_DIR}"))
+        print(Style.info("Check CODEX_HOME environment variable."))
+        sys.exit(1)
+    projects = group_by_project(records)
+    global_latest = records[0].path
+
+    screen = 'all'          # 'all' | 'project_list' | 'project_sessions'
+    page = 0
+    cur_project: Optional[Dict] = None
+
+    def total_pages_for(n: int) -> int:
+        return max(1, (n + SESSIONS_PER_PAGE - 1) // SESSIONS_PER_PAGE)
+
+    def pause(msg: str = "Press Enter..."):
+        input(f"{Style.DIM}{msg}{Style.RESET}")
+
     while True:
         print_menu_header()
 
-        files = get_all_sessions()
-        if not files:
-            print(Style.error(f"No sessions found in {SESSIONS_DIR}"))
-            print(Style.info("Check CODEX_HOME environment variable."))
-            sys.exit(1)
+        # ───────────────── ALL SESSIONS (flat) ─────────────────
+        if screen == 'all':
+            total = len(records)
+            total_pages = total_pages_for(total)
+            page = max(0, min(page, total_pages - 1))
+            start = page * SESSIONS_PER_PAGE
+            page_recs = records[start:start + SESSIONS_PER_PAGE]
+            page_paths = [r.path for r in page_recs]
 
-        list_sessions_table(files[:15])
+            print(f"  {Style.BOLD}{Style.HEADER}ALL SESSIONS{Style.RESET}   "
+                  f"{Style.DIM}{total} sessions · {len(projects)} projects{Style.RESET}\n")
+            render_session_table(page_recs, start_no=1,
+                                 global_latest=global_latest, show_project=True)
+            _print_pager(page, total_pages, total, "sessions")
 
-        if len(files) > 15:
-            print(f"{Style.DIM}(Showing 15 of {len(files)} sessions. Older files hidden){Style.RESET}\n")
+            print(f"\n{Style.BOLD}OPTIONS:{Style.RESET}  {Style.DIM}(single keypress; type a number to select){Style.RESET}")
+            print(f"  {Style.GREEN}[#, #]{Style.RESET}      Convert sessions on this page (e.g. '1, 3')")
+            print(f"  {Style.YELLOW}[a]{Style.RESET}         Convert all sessions on this page")
+            print(f"  {Style.CYAN}[←/→]{Style.RESET} or {Style.CYAN}[n/p]{Style.RESET}  Next / previous page")
+            print(f"  {Style.BLUE}[m]{Style.RESET}         Switch to PROJECT view")
+            print(f"  {Style.RED}[q]{Style.RESET}         Quit")
 
-        print(f"{Style.BOLD}OPTIONS:{Style.RESET}")
-        print(f"  {Style.GREEN}[ID, ID]{Style.RESET} : Convert specific sessions (e.g. '1, 3')")
-        print(f"  {Style.YELLOW}[a]{Style.RESET}      : Convert ALL listed sessions")
-        print(f"  {Style.RED}[q]{Style.RESET}      : Quit")
+            action, value = _read_browser_action(f"\n{Style.BOLD}Select > {Style.RESET}")
+            if action == 'cmd' and value == 'Q':
+                print("Bye."); sys.exit(0)
+            elif action == 'cmd' and value == 'M':
+                screen = 'project_list'; page = 0
+            elif action == 'next':
+                if page < total_pages - 1:
+                    page += 1
+            elif action == 'prev':
+                if page > 0:
+                    page -= 1
+            elif action == 'cmd' and value == 'A':
+                if page_paths:
+                    confirm = input(f"{Style.warn(f'Convert all {len(page_paths)} sessions on this page? (y/n): ')}")
+                    if confirm.strip().lower() == 'y':
+                        convert_files(page_paths)
+            elif action == 'select':
+                sel = _parse_row_selection(value, page_paths)
+                if sel:
+                    convert_files(sel)
+                else:
+                    pause()
+            continue
 
-        choice = input(f"\n{Style.BOLD}Select > {Style.RESET}").strip().lower()
+        # ───────────────── PROJECT LIST ─────────────────
+        if screen == 'project_list':
+            total = len(projects)
+            total_pages = total_pages_for(total)
+            page = max(0, min(page, total_pages - 1))
+            start = page * SESSIONS_PER_PAGE
+            page_projs = projects[start:start + SESSIONS_PER_PAGE]
 
-        if choice == 'q':
-            print("Bye.")
-            sys.exit(0)
-        elif choice == 'a':
-            confirm = input(f"{Style.warn('Convert ALL displayed sessions? (y/n): ')}")
-            if confirm.lower() == 'y':
-                process_conversion(",".join([str(i+1) for i in range(len(files[:15]))]), files)
-        elif choice:
-            process_conversion(choice, files)
+            print(f"  {Style.BOLD}{Style.HEADER}PROJECTS{Style.RESET}   "
+                  f"{Style.DIM}{total} projects · {len(records)} sessions{Style.RESET}\n")
+            render_project_table(page_projs, records, start_no=1)
+            _print_pager(page, total_pages, total, "projects")
+
+            print(f"\n{Style.BOLD}OPTIONS:{Style.RESET}  {Style.DIM}(single keypress; type a number to open){Style.RESET}")
+            print(f"  {Style.GREEN}[#]{Style.RESET}         Open a project to view its sessions")
+            print(f"  {Style.CYAN}[←/→]{Style.RESET} or {Style.CYAN}[n/p]{Style.RESET}  Next / previous page")
+            print(f"  {Style.BLUE}[m]{Style.RESET}         Switch to ALL-SESSIONS view")
+            print(f"  {Style.RED}[q]{Style.RESET}         Quit")
+
+            action, value = _read_browser_action(f"\n{Style.BOLD}Select > {Style.RESET}")
+            if action == 'cmd' and value == 'Q':
+                print("Bye."); sys.exit(0)
+            elif action == 'cmd' and value == 'M':
+                screen = 'all'; page = 0
+            elif action == 'next':
+                if page < total_pages - 1:
+                    page += 1
+            elif action == 'prev':
+                if page > 0:
+                    page -= 1
+            elif action == 'select':
+                digits = value.strip()
+                if digits.isdigit():
+                    n = int(digits)
+                    if 1 <= n <= len(page_projs):
+                        cur_project = page_projs[n - 1]
+                        screen = 'project_sessions'; page = 0
+                    else:
+                        print(Style.warn(f"Project {n} is not on this page (1-{len(page_projs)})."))
+                        pause()
+                else:
+                    print(Style.warn("Enter a single project number to open it."))
+                    pause()
+            continue
+
+        # ───────────────── SESSIONS WITHIN A PROJECT ─────────────────
+        if screen == 'project_sessions':
+            proj_recs = [records[i] for i in cur_project['idxs']]
+            total = len(proj_recs)
+            total_pages = total_pages_for(total)
+            page = max(0, min(page, total_pages - 1))
+            start = page * SESSIONS_PER_PAGE
+            page_recs = proj_recs[start:start + SESSIONS_PER_PAGE]
+            page_paths = [r.path for r in page_recs]
+
+            print(f"  {Style.BOLD}{Style.HEADER}PROJECT:{Style.RESET} {Style.BOLD}{cur_project['pname']}{Style.RESET}   "
+                  f"{Style.DIM}{total} session{'s' if total != 1 else ''}{Style.RESET}")
+            print(f"  {Style.DIM}{cur_project['cwd'] or '(unknown path)'}{Style.RESET}\n")
+            render_session_table(page_recs, start_no=1,
+                                 global_latest=global_latest, show_project=False)
+            _print_pager(page, total_pages, total, "sessions")
+
+            print(f"\n{Style.BOLD}OPTIONS:{Style.RESET}  {Style.DIM}(single keypress; type a number to select){Style.RESET}")
+            print(f"  {Style.GREEN}[#, #]{Style.RESET}      Convert sessions on this page (e.g. '1, 3')")
+            print(f"  {Style.YELLOW}[a]{Style.RESET}         Convert all sessions on this page")
+            print(f"  {Style.CYAN}[←/→]{Style.RESET} or {Style.CYAN}[n/p]{Style.RESET}  Next / previous page")
+            print(f"  {Style.BLUE}[b]{Style.RESET}         Back to project list")
+            print(f"  {Style.RED}[q]{Style.RESET}         Quit")
+
+            action, value = _read_browser_action(f"\n{Style.BOLD}Select > {Style.RESET}")
+            if action == 'cmd' and value == 'Q':
+                print("Bye."); sys.exit(0)
+            elif action == 'cmd' and value == 'B':
+                screen = 'project_list'; page = 0; cur_project = None
+            elif action == 'cmd' and value == 'M':
+                screen = 'all'; page = 0; cur_project = None
+            elif action == 'next':
+                if page < total_pages - 1:
+                    page += 1
+            elif action == 'prev':
+                if page > 0:
+                    page -= 1
+            elif action == 'cmd' and value == 'A':
+                if page_paths:
+                    confirm = input(f"{Style.warn(f'Convert all {len(page_paths)} sessions on this page? (y/n): ')}")
+                    if confirm.strip().lower() == 'y':
+                        convert_files(page_paths)
+            elif action == 'select':
+                sel = _parse_row_selection(value, page_paths)
+                if sel:
+                    convert_files(sel)
+                else:
+                    pause()
+            continue
 
 if __name__ == "__main__":
     try:

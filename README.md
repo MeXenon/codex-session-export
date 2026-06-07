@@ -36,6 +36,7 @@ Because it’s a pure Python CLI tool, it's completely **portable**. You can use
 
 ## ✨ Features
 
+- **Project View & Pagination *(New in v2.6)*:** Just like Codex Desktop, your sessions are now grouped by **project** (their working directory). Toggle between a flat **All Sessions** list and a **Projects** view with a single key, drill into any project to see only its threads, and page through large histories cleanly with `n`/`p` — no more giant unreadable walls of sessions.
 - **20 Filterable Sections:** Toggle everything from User/Agent messages to hidden agent reasoning, terminal commands, MCP tool calls, git snapshots, and more.
 - **Parallel Exports:** Select and process multiple sessions at the same time. The filter will show you the combined line counts and will export them simultaneously in one batch.
 - **Dynamic Output Capping:** Terminal payloads can be hundreds of thousands of lines long. Instantly cap output blocks to exactly 1, 5, 8, 10, or up to 500 lines to keep your context windows lean.
@@ -85,7 +86,17 @@ python codex-md.py
 
 ### The Interface
 
-1. **Select a session:** The script automatically scans `~/.codex/sessions` and presents a chronological list of your recent threads. Type the ID of the session (e.g., `1`) or select multiple (e.g., `1,2,3`).
+1. **Browse & select a session:** The script scans `~/.codex/sessions` once and opens a paginated browser with two view modes:
+   * **All Sessions** *(default)* — a flat, newest-first list of every thread, with a **Project** column so you can see at a glance which working directory each one belongs to.
+   * **Projects** — your sessions grouped by **project** (working directory), just like Codex Desktop. Each row shows the project name, how many sessions it has, and when it was last active. Open a project (type its number) to drill into just that project's threads.
+
+   Navigation (single keypress — no Enter needed, except when typing numbers):
+   * `←` / `→` (or `↑` / `↓`, or `n` / `p`) — previous / next page.
+   * **Type a number** — convert the session(s) on the **current page** (e.g. `1`, or `1, 3, 5`; numbers are page-local, press Enter to confirm). In the **Projects** view a number instead opens that project.
+   * `a` — convert every session shown on the current page.
+   * `m` — toggle between **All Sessions** and **Projects** views.
+   * `b` — back to the project list (when you're inside a project).
+   * `q` — quit.
 2. **Choose extraction scope:**
    * **[F] Full Session** — Export all turns (default).
    * **[L] Last N Turns** — Enter a number and only the most recent N turns are included.
