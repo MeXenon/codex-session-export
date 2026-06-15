@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Codex Session Manager & Markdown Converter  (v2.6.0)
+Codex Session Manager & Markdown Converter  (v2.7.0)
 -------------------------------------------------
 An interactive tool to browse, filter, and convert OpenAI Codex
 session logs (.jsonl) into readable Markdown documents.
@@ -714,7 +714,7 @@ class SessionParser:
             ptype = repl_item.get('type', '')
             role = repl_item.get('role', '')
             content = repl_item.get('content', [])
-            
+
             # Helper to extract text from content array or string
             def extract_text(c):
                 if isinstance(c, list):
@@ -738,7 +738,8 @@ class SessionParser:
 
     # --- markdown rendering with filter ---
     def to_markdown(self, section_filter: Optional[Dict[str, bool]] = None,
-                    clean_content: bool = False, output_cap: int = 0, user_cap: int = 0, agent_cap: int = 0, reasoning_cap: int = 0, internal_cap: int = 0) -> str:
+                    clean_content: bool = False, output_cap: int = 0, user_cap: int = 0, agent_cap: int = 0, reasoning_cap: int = 0, internal_cap: int = 0,
+                    last_agent_per_turn: bool = False) -> str:
         if section_filter is None:
             section_filter = {s[0]: True for s in SECTION_DEFS}
 
@@ -754,7 +755,7 @@ class SessionParser:
 
         keep_indices = set(range(len(self.data)))
         counts = {'user_message': 0, 'agent_message': 0, 'agent_reasoning': 0, 'reasoning': 0}
-        
+
         for i in range(len(self.data) - 1, -1, -1):
             itype = self.data[i]['type']
             if itype == 'user_message' and user_cap > 0:
@@ -769,6 +770,26 @@ class SessionParser:
             elif itype == 'reasoning' and internal_cap > 0:
                 if counts['reasoning'] >= internal_cap: keep_indices.remove(i)
                 counts['reasoning'] += 1
+
+        # --- last_agent_per_turn: keep only the final agent_message per turn ---
+        if last_agent_per_turn:
+            agent_suppress: set = set()
+            _i = 0
+            _data = self.data
+            while _i < len(_data):
+                if _data[_i]['type'] == 'agent_message':
+                    run_indices = []
+                    _j = _i
+                    while _j < len(_data) and _data[_j]['type'] != 'user_message':
+                        if _data[_j]['type'] == 'agent_message':
+                            run_indices.append(_j)
+                        _j += 1
+                    for suppress_idx in run_indices[:-1]:
+                        agent_suppress.add(suppress_idx)
+                    _i = _j
+                else:
+                    _i += 1
+            keep_indices -= agent_suppress
 
         md: List[str] = []
         md.append(f"# {self.title}\n")
@@ -942,21 +963,21 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
     Returns (section_filter, clean_content, output_cap, user_cap, agent_cap, reasoning_cap, internal_cap).
     """
     _line_cache = {}
-    
+
     def get_lines_for_state(cap_out: int, cap_user: int, cap_agent: int, cap_reason: int, cap_internal: int, cc: bool):
         cache_key = (cap_out, cap_user, cap_agent, cap_reason, cap_internal, cc)
         if cache_key in _line_cache:
             return _line_cache[cache_key]
-        
+
         counts = {s[0]: 0 for s in SECTION_DEFS}
         msg_counts: Dict[str, int] = {}  # actual block/message counts for chat types
         tool_call_types = {'terminal_cmd', 'mcp_tool', 'other_tool'}
         tool_output_types = {'terminal_output', 'mcp_tool_output', 'other_tool_output'}
-        
+
         for parser in parsers:
             keep_indices = set(range(len(parser.data)))
             chat_counts = {'u': 0, 'a': 0, 'r': 0, 'i': 0}
-            
+
             for i in range(len(parser.data) - 1, -1, -1):
                 itype = parser.data[i]['type']
                 if itype == 'user_message' and cap_user > 0:
@@ -971,18 +992,18 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
                 elif itype == 'reasoning' and cap_internal > 0:
                     if chat_counts['i'] >= cap_internal: keep_indices.remove(i)
                     chat_counts['i'] += 1
-            
+
             for i, item in enumerate(parser.data):
                 if i not in keep_indices: continue
                 itype = item['type']
                 content = item.get('content', '')
                 if isinstance(content, list): content = '\n'.join(str(x) for x in content)
                 elif not isinstance(content, str): content = str(content)
-                
+
                 # Count actual messages for chat-type sections
                 if itype in ('user_message', 'agent_message', 'agent_reasoning', 'reasoning'):
                     msg_counts[itype] = msg_counts.get(itype, 0) + 1
-                
+
                 if itype == 'user_message':
                     if cc: content = trim_chat_content(content)
                     lines = content.count('\n') + 4 if content else 0
@@ -1019,32 +1040,34 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
                     lines = content.count('\n') + 5
                 else:
                     lines = 1
-                    
+
                 counts[itype] = counts.get(itype, 0) + lines
-                
+
             if parser.metadata:
                 counts['session_meta'] = counts.get('session_meta', 0) + 5
-                
+
         _line_cache[cache_key] = (counts, msg_counts)
         return counts, msg_counts
 
     fstate: Dict[str, bool] = {s[0]: s[3] for s in SECTION_DEFS}
     clean_content = False
-    
+
     output_cap = 8
     cap_idx = CAP_STEPS.index(8)
-    
+
     user_cap = 0
     u_idx = 0
-    
+
     agent_cap = 0
     a_idx = 0
-    
+
     reason_cap = 0
     r_idx = 0
-    
+
     internal_cap = 0
     i_idx = 0
+
+    last_agent_per_turn = False
 
     cursor = 0
     ROW_CLEAN = len(SECTION_DEFS)
@@ -1052,8 +1075,9 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
     ROW_USER  = len(SECTION_DEFS) + 2
     ROW_AGENT = len(SECTION_DEFS) + 3
     ROW_REASON= len(SECTION_DEFS) + 4
-    ROW_INTERNAL = len(SECTION_DEFS) + 5
-    num_items = len(SECTION_DEFS) + 6
+    ROW_INTERNAL   = len(SECTION_DEFS) + 5
+    ROW_LAST_AGENT = len(SECTION_DEFS) + 6
+    num_items      = len(SECTION_DEFS) + 7
 
     import shutil as _shutil
 
@@ -1082,10 +1106,10 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
                 is_cursor = (i == cursor)
                 is_on     = fstate.get(key, False)
                 lines     = agg_lines.get(key, 0)
-                
+
                 arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if is_cursor else ' '
                 toggle = f'{Style.GREEN}██{Style.RESET}' if is_on else f'{Style.DIM}░░{Style.RESET}'
-                
+
                 if is_cursor and is_on: nstyle = f'{Style.BOLD}{Style.GREEN}'
                 elif is_cursor and not is_on: nstyle = f'{Style.BOLD}{Style.RED}'
                 elif is_on: nstyle = ''
@@ -1159,6 +1183,18 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
             i_hint = f' {Style.DIM}◀▶{Style.RESET}' if i_cur else ''
             mid_rows.append((ROW_INTERNAL, f'  {i_arrow}    {i_st}🔒 Internal Reasoning Cap{Style.RESET} {Style.DIM}(blocks){Style.RESET}       {i_label}{i_hint}'))
 
+            # Last Agent Per Turn
+            la_on    = last_agent_per_turn
+            la_cur   = (cursor == ROW_LAST_AGENT)
+            la_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if la_cur else ' '
+            la_tog   = f'{Style.GREEN}██{Style.RESET}' if la_on else f'{Style.DIM}░░{Style.RESET}'
+            la_st    = f'{Style.BOLD}' if la_cur else Style.DIM
+            la_val   = f'{Style.GREEN}ON {Style.RESET}' if la_on else f'{Style.DIM}OFF{Style.RESET}'
+            mid_rows.append((ROW_LAST_AGENT,
+                f'  {la_arrow} {la_tog} {la_st}🔁 Last Agent Response Per Turn'
+                f'{Style.RESET} {Style.DIM}(keep only final reply per user message)'
+                f'{Style.RESET}  {la_val}'))
+
             # ── Viewport math ──
             term_size = _shutil.get_terminal_size((80, 30))
             term_h = max(10, term_size.lines)
@@ -1227,6 +1263,8 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
                     fstate[skey] = not fstate[skey]
                 elif cursor == ROW_CLEAN:
                     clean_content = not clean_content
+                elif cursor == ROW_LAST_AGENT:
+                    last_agent_per_turn = not last_agent_per_turn
             elif key == 'LEFT':
                 if cursor == ROW_CAP:
                     cap_idx = max(0, cap_idx - 1)
@@ -1278,6 +1316,7 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
                 r_idx = 0
                 internal_cap = 0
                 i_idx = 0
+                last_agent_per_turn = False
             elif key == 'Q' or key == 'ESC':
                 break
             elif key.isdigit():
@@ -1295,7 +1334,7 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
         sys.stdout.write('\033[?25h\033[?1049l')
         sys.stdout.flush()
 
-    return fstate, clean_content, output_cap, user_cap, agent_cap, reason_cap, internal_cap
+    return fstate, clean_content, output_cap, user_cap, agent_cap, reason_cap, internal_cap, last_agent_per_turn
 
 # ──────────────────────────────────────────────────────────────
 # Extraction Scope (Last N Turns)
@@ -1316,12 +1355,12 @@ def select_extraction_scope(parsers: List[SessionParser]) -> Tuple[str, int]:
         if len(title) > 42:
             title = title[:39] + "..."
         print(f"  {Style.CYAN}{label}{Style.RESET}  {Style.DIM}{title}{Style.RESET}")
-        
+
         ctx_str = ""
         if p.model_context_window > 0:
             pct = (p.latest_input_tokens / p.model_context_window) * 100
             ctx_str = f"  {Style.DIM}Live Context: {p.latest_input_tokens//1000}k/{p.model_context_window//1000}k tokens ({pct:.1f}%){Style.RESET}"
-            
+
         print(f"           {Style.BOLD}{tc}{Style.RESET} turn{'s' if tc != 1 else ''}{ctx_str}\n")
 
     print(f"  {Style.DIM}{'━' * 52}{Style.RESET}")
@@ -1438,7 +1477,7 @@ def print_menu_header():
     os.system('cls' if os.name == 'nt' else 'clear')
     print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.6.0{Style.RESET}")
     print(f"{Style.DIM}Directory: {SESSIONS_DIR}{Style.RESET}")
-    print(f"{Style.DIM}Output:    {Path(__file__).parent.resolve()}{Style.RESET}\n")
+    print(f"{Style.DIM}Output:    {Path.cwd()}{Style.RESET}\n")
 
 def format_relative_time(mtime: float) -> str:
     now = datetime.now().timestamp()
@@ -1640,7 +1679,7 @@ def convert_files(valid_files: List[Path]):
         for p in parsers:
             p.trim_to_live_context()
         scope_label = "live context"
-    section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap, internal_cap = interactive_filter(parsers, scope_label=scope_label)
+    section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap, internal_cap, last_agent_per_turn = interactive_filter(parsers, scope_label=scope_label)
 
     # Check anything is selected
     if not any(section_filter.values()):
@@ -1649,7 +1688,7 @@ def convert_files(valid_files: List[Path]):
         return
 
     _clear_screen()
-    
+
     # Ask for export destination
     dest_choice = ''
     while dest_choice not in ('f', 'c', 'b'):
@@ -1658,16 +1697,13 @@ def convert_files(valid_files: List[Path]):
         print(f"    {Style.YELLOW}[C]{Style.RESET}lipboard (copy directly)")
         print(f"    {Style.YELLOW}[B]{Style.RESET}oth")
         dest_choice = input(f"\n  {Style.BOLD}Select > {Style.RESET}").strip().lower()
-        if not dest_choice: 
+        if not dest_choice:
             dest_choice = 'f'
 
     # Export
     print(f"\n{Style.info(f'Processing {len(parsers)} session(s)...')}")
 
-    try:
-        out_dir = Path(__file__).parent.resolve()
-    except NameError:
-        out_dir = Path.cwd()
+    out_dir = Path.cwd()
 
     clipboard_md = []
 
@@ -1681,6 +1717,7 @@ def convert_files(valid_files: List[Path]):
                 agent_cap=agent_cap,
                 reasoning_cap=reason_cap,
                 internal_cap=internal_cap,
+                last_agent_per_turn=last_agent_per_turn,
             )
 
             date_prefix = datetime.fromtimestamp(
@@ -1704,7 +1741,7 @@ def convert_files(valid_files: List[Path]):
                     outfile.write(md_content)
                 print(f"  {Style.GREEN}➜{Style.RESET} Saved: {out_filename}  "
                       f"{Style.CYAN}({line_count:,} lines){Style.RESET}")
-                
+
         except Exception as e:
             print(f"  {Style.error(f'Failed {parser.filepath.name}: {e}')}")
 
