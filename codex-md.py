@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Codex Session Manager & Markdown Converter  (v2.6.0)
+Codex Session Manager & Markdown Converter  (v2.6.2)
 -------------------------------------------------
 An interactive tool to browse, filter, and convert OpenAI Codex
 session logs (.jsonl) into readable Markdown documents.
@@ -1375,14 +1375,15 @@ def project_display_name(cwd: Optional[str]) -> str:
 # ──────────────────────────────────────────────────────────────
 class SessionRecord:
     """Lightweight metadata for one session, captured during the scan."""
-    __slots__ = ('path', 'mtime', 'cwd', 'pkey', 'pname')
+    __slots__ = ('path', 'mtime', 'cwd', 'pkey', 'pname', 'session_id')
 
-    def __init__(self, path: Path, mtime: float, cwd: Optional[str]):
+    def __init__(self, path: Path, mtime: float, cwd: Optional[str], session_id: Optional[str] = None):
         self.path = path
         self.mtime = mtime
         self.cwd = cwd or ""
         self.pkey = project_key_from_cwd(cwd)
         self.pname = project_display_name(cwd)
+        self.session_id = session_id or path.stem.replace("rollout-", "")
 
 
 def scan_sessions() -> List[SessionRecord]:
@@ -1402,11 +1403,12 @@ def scan_sessions() -> List[SessionRecord]:
         meta, _, saw_user_event = read_session_summary(path)
         if is_interactive_session_meta(meta) and saw_user_event:
             cwd = meta.get('cwd') if isinstance(meta, dict) else None
+            session_id = meta.get('id') if isinstance(meta.get('id'), str) else None
             try:
                 mtime = path.stat().st_mtime
             except OSError:
                 mtime = 0.0
-            records.append(SessionRecord(path, mtime, cwd))
+            records.append(SessionRecord(path, mtime, cwd, session_id))
     records.sort(key=lambda r: r.mtime, reverse=True)
     return records
 
@@ -1436,9 +1438,9 @@ def group_by_project(records: List[SessionRecord]) -> List[Dict]:
 
 def print_menu_header():
     os.system('cls' if os.name == 'nt' else 'clear')
-    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.6.0{Style.RESET}")
+    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.6.2{Style.RESET}")
     print(f"{Style.DIM}Directory: {SESSIONS_DIR}{Style.RESET}")
-    print(f"{Style.DIM}Output:    {Path(__file__).parent.resolve()}{Style.RESET}\n")
+    print(f"{Style.DIM}Default output: {script_directory()}{Style.RESET}\n")
 
 def format_relative_time(mtime: float) -> str:
     now = datetime.now().timestamp()
@@ -1609,6 +1611,263 @@ def copy_to_clipboard(text: str) -> bool:
     except Exception:
         return False
 
+def script_directory() -> Path:
+    """Directory containing this script; falls back to the current shell cwd."""
+    try:
+        return Path(__file__).parent.resolve()
+    except NameError:
+        return Path.cwd().resolve()
+
+def prompt_yes_no(prompt: str, default: bool = False) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    while True:
+        answer = input(f"  {Style.BOLD}{prompt} [{suffix}] > {Style.RESET}").strip().lower()
+        if not answer:
+            return default
+        if answer in ('y', 'yes'):
+            return True
+        if answer in ('n', 'no'):
+            return False
+        print(f"  {Style.error('Enter y or n.')}")
+
+def project_dir_for_parser(parser: SessionParser) -> Optional[Path]:
+    """Return the session cwd as a real local directory, if available."""
+    cwd = parser.metadata.get('cwd') if isinstance(parser.metadata, dict) else None
+    if not isinstance(cwd, str) or not cwd.strip():
+        return None
+    try:
+        path = Path(os.path.expandvars(cwd.strip())).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path = path.resolve()
+    except (OSError, RuntimeError):
+        return None
+    return path if path.is_dir() else None
+
+def available_project_dirs(parsers: List[SessionParser]) -> List[Path]:
+    dirs: List[Path] = []
+    seen: Set[str] = set()
+    for parser in parsers:
+        project_dir = project_dir_for_parser(parser)
+        if project_dir is None:
+            continue
+        key = os.path.normcase(str(project_dir))
+        if key not in seen:
+            seen.add(key)
+            dirs.append(project_dir)
+    return dirs
+
+def prompt_custom_output_dir() -> Optional[Path]:
+    while True:
+        raw = input(f"  {Style.BOLD}Directory path (blank to cancel) > {Style.RESET}").strip().strip('"')
+        if not raw:
+            return None
+        try:
+            path = Path(os.path.expandvars(raw)).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            path = path.resolve()
+        except (OSError, RuntimeError) as exc:
+            print(f"  {Style.error(f'Invalid path: {exc}')}")
+            continue
+
+        if path.exists():
+            if path.is_dir():
+                return path
+            print(f"  {Style.error('That path exists but is not a directory.')}")
+            continue
+
+        if prompt_yes_no(f"Create {path}?", default=True):
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                return path
+            except OSError as exc:
+                print(f"  {Style.error(f'Could not create directory: {exc}')}")
+
+def select_save_location(parsers: List[SessionParser]) -> Tuple[str, Optional[Path]]:
+    """Ask where file exports should be written.
+
+    Returns ('script', path), ('custom', path), or ('project', None). Project
+    mode resolves per session so multi-project exports can stay with each cwd.
+    """
+    default_dir = script_directory()
+    project_dirs = available_project_dirs(parsers)
+
+    while True:
+        print(f"\n  {Style.BOLD}Save Location:{Style.RESET}")
+        print(f"    {Style.YELLOW}[S]{Style.RESET}cript directory       {Style.DIM}{default_dir} [Default]{Style.RESET}")
+        if project_dirs:
+            if len(project_dirs) == 1:
+                print(f"    {Style.YELLOW}[P]{Style.RESET}roject directory      {Style.DIM}{project_dirs[0]}{Style.RESET}")
+            else:
+                print(f"    {Style.YELLOW}[P]{Style.RESET}roject directories    {Style.DIM}save each session beside its own project ({len(project_dirs)} folders){Style.RESET}")
+        else:
+            print(f"    {Style.DIM}[P]roject directory      unavailable; no selected session cwd exists locally{Style.RESET}")
+        print(f"    {Style.YELLOW}[C]{Style.RESET}ustom directory")
+
+        choice = input(f"\n  {Style.BOLD}Select > {Style.RESET}").strip().lower()
+        if not choice:
+            choice = 's'
+        if choice == 's':
+            return 'script', default_dir
+        if choice == 'p':
+            if project_dirs:
+                return 'project', None
+            print(f"  {Style.warn('No usable project directory was found for the selected session(s).')}")
+            continue
+        if choice == 'c':
+            custom_dir = prompt_custom_output_dir()
+            if custom_dir is not None:
+                return 'custom', custom_dir
+            continue
+        print(f"  {Style.error('Choose S, P, or C.')}")
+
+def output_dir_for_parser(parser: SessionParser, save_mode: str,
+                          selected_dir: Optional[Path], fallback_dir: Path) -> Tuple[Path, bool]:
+    if save_mode == 'project':
+        project_dir = project_dir_for_parser(parser)
+        if project_dir is not None:
+            return project_dir, False
+        return fallback_dir, True
+    return selected_dir or fallback_dir, False
+
+def next_available_path(path: Path) -> Path:
+    counter = 2
+    while True:
+        candidate = path.with_name(f"{path.stem}-{counter}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+def resolve_output_path_conflict(path: Path) -> Tuple[Optional[Path], str]:
+    if not path.exists():
+        return path, 'new'
+
+    print(f"\n  {Style.warn(f'File already exists: {path}')}")
+    print(f"    {Style.YELLOW}[O]{Style.RESET}verwrite  {Style.DIM}[Default]{Style.RESET}")
+    print(f"    {Style.YELLOW}[R]{Style.RESET}ename")
+    print(f"    {Style.YELLOW}[S]{Style.RESET}kip")
+
+    while True:
+        choice = input(f"\n  {Style.BOLD}Select > {Style.RESET}").strip().lower()
+        if not choice:
+            choice = 'o'
+        if choice == 'o':
+            return path, 'overwrite'
+        if choice == 'r':
+            return next_available_path(path), 'rename'
+        if choice == 's':
+            return None, 'skip'
+        print(f"  {Style.error('Choose O, R, or S.')}")
+
+def file_manager_name() -> str:
+    if sys.platform == 'win32':
+        return "File Explorer"
+    if sys.platform == 'darwin':
+        return "Finder"
+    return "file manager"
+
+def open_file_default(target: Path) -> bool:
+    import shutil
+    import subprocess
+
+    try:
+        if sys.platform == 'win32':
+            os.startfile(str(target))  # type: ignore[attr-defined]
+            return True
+        if sys.platform == 'darwin':
+            subprocess.Popen(['open', str(target)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+
+        opener = shutil.which('xdg-open') or shutil.which('gio') or shutil.which('gnome-open') or shutil.which('kde-open')
+        if not opener:
+            return False
+        if Path(opener).name == 'gio':
+            subprocess.Popen([opener, 'open', str(target)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen([opener, str(target)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+def open_in_file_manager(target: Path) -> bool:
+    import shutil
+    import subprocess
+
+    try:
+        if sys.platform == 'win32':
+            if target.is_file():
+                subprocess.Popen(['explorer', f'/select,{str(target)}'])
+            else:
+                os.startfile(str(target))  # type: ignore[attr-defined]
+            return True
+        if sys.platform == 'darwin':
+            args = ['open', '-R', str(target)] if target.is_file() else ['open', str(target)]
+            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+
+        directory = target.parent if target.is_file() else target
+        opener = shutil.which('xdg-open') or shutil.which('gio') or shutil.which('gnome-open') or shutil.which('kde-open')
+        if not opener:
+            return False
+        if Path(opener).name == 'gio':
+            subprocess.Popen([opener, 'open', str(directory)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen([opener, str(directory)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+def prompt_open_saved_outputs(saved_paths: List[Path]) -> bool:
+    if not saved_paths:
+        return False
+
+    unique_dirs: List[Path] = []
+    seen: Set[str] = set()
+    for path in saved_paths:
+        directory = path.parent
+        key = os.path.normcase(str(directory))
+        if key not in seen:
+            seen.add(key)
+            unique_dirs.append(directory)
+
+    manager = file_manager_name()
+    while True:
+        print(f"\n  {Style.BOLD}Open Saved Output:{Style.RESET}")
+        if len(saved_paths) == 1:
+            print(f"    {Style.YELLOW}[F]{Style.RESET}ile       {Style.DIM}open Markdown file in the default app{Style.RESET}")
+        else:
+            print(f"    {Style.YELLOW}[F]{Style.RESET}irst file {Style.DIM}open the first saved Markdown file{Style.RESET}")
+        if len(unique_dirs) == 1:
+            print(f"    {Style.YELLOW}[D]{Style.RESET}irectory  {Style.DIM}show the output folder in {manager}{Style.RESET}")
+        else:
+            print(f"    {Style.YELLOW}[D]{Style.RESET}irectories {Style.DIM}open {len(unique_dirs)} output folders in {manager}{Style.RESET}")
+        print(f"    {Style.YELLOW}[N]{Style.RESET}one       {Style.DIM}[Default]{Style.RESET}")
+        choice = input(f"\n  {Style.BOLD}Select > {Style.RESET}").strip().lower()
+        if not choice:
+            choice = 'n'
+        if choice == 'n':
+            return False
+        if choice == 'f':
+            target = saved_paths[0]
+            if open_file_default(target):
+                print(f"  {Style.GREEN}➜{Style.RESET} Opened: {target}")
+                return True
+            else:
+                print(f"  {Style.warn(f'Could not open {target}')}")
+                return False
+        if choice == 'd':
+            opened = 0
+            for target in unique_dirs:
+                if open_in_file_manager(target):
+                    opened += 1
+                else:
+                    print(f"  {Style.warn(f'Could not open {target}')}")
+            if opened:
+                print(f"  {Style.GREEN}➜{Style.RESET} Opened {opened} location{'s' if opened != 1 else ''}.")
+            return opened > 0
+        print(f"  {Style.error('Choose F, D, or N.')}")
+
 def convert_files(valid_files: List[Path]):
     """Run the full extraction/filter/export flow for a set of session files.
 
@@ -1640,6 +1899,7 @@ def convert_files(valid_files: List[Path]):
         for p in parsers:
             p.trim_to_live_context()
         scope_label = "live context"
+
     section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap, internal_cap = interactive_filter(parsers, scope_label=scope_label)
 
     # Check anything is selected
@@ -1661,15 +1921,18 @@ def convert_files(valid_files: List[Path]):
         if not dest_choice: 
             dest_choice = 'f'
 
+    save_mode = 'clipboard'
+    selected_out_dir: Optional[Path] = None
+    fallback_out_dir = script_directory()
+    if dest_choice in ('f', 'b'):
+        save_mode, selected_out_dir = select_save_location(parsers)
+
     # Export
     print(f"\n{Style.info(f'Processing {len(parsers)} session(s)...')}")
 
-    try:
-        out_dir = Path(__file__).parent.resolve()
-    except NameError:
-        out_dir = Path.cwd()
-
     clipboard_md = []
+    saved_paths: List[Path] = []
+    project_fallback_reported = False
 
     for parser in parsers:
         try:
@@ -1699,11 +1962,28 @@ def convert_files(valid_files: List[Path]):
 
             # Write to file
             if dest_choice in ('f', 'b'):
+                out_dir, used_project_fallback = output_dir_for_parser(
+                    parser, save_mode, selected_out_dir, fallback_out_dir
+                )
+                if used_project_fallback and not project_fallback_reported:
+                    print(f"  {Style.warn(f'Some selected sessions do not have a usable local project directory; using {fallback_out_dir}.')}")
+                    project_fallback_reported = True
                 out_path = out_dir / out_filename
+                resolved_path, conflict_action = resolve_output_path_conflict(out_path)
+                if resolved_path is None:
+                    print(f"  {Style.YELLOW}➜{Style.RESET} Skipped existing file: {out_path}")
+                    continue
+                out_path = resolved_path
                 with open(out_path, 'w', encoding='utf-8') as outfile:
                     outfile.write(md_content)
-                print(f"  {Style.GREEN}➜{Style.RESET} Saved: {out_filename}  "
-                      f"{Style.CYAN}({line_count:,} lines){Style.RESET}")
+                saved_paths.append(out_path)
+                action_label = ""
+                if conflict_action == 'overwrite':
+                    action_label = f" {Style.DIM}(overwritten){Style.RESET}"
+                elif conflict_action == 'rename':
+                    action_label = f" {Style.DIM}(renamed){Style.RESET}"
+                print(f"  {Style.GREEN}➜{Style.RESET} Saved: {out_path}  "
+                      f"{Style.CYAN}({line_count:,} lines){Style.RESET}{action_label}")
                 
         except Exception as e:
             print(f"  {Style.error(f'Failed {parser.filepath.name}: {e}')}")
@@ -1718,9 +1998,84 @@ def convert_files(valid_files: List[Path]):
         else:
             print(f"  {Style.RED}➜{Style.RESET} Failed to copy to clipboard! (Is xclip/xsel installed?)")
 
+    prompt_open_saved_outputs(saved_paths)
+
     input(f"\n{Style.DIM}Press Enter to return to menu...{Style.RESET}")
 
 SESSIONS_PER_PAGE = 12
+
+def find_records_by_session_id(records: List[SessionRecord], query: str) -> List[SessionRecord]:
+    needle = query.strip().strip('"').lower()
+    if needle.startswith("rollout-"):
+        needle = needle[len("rollout-"):]
+    if len(needle) < 6:
+        return []
+
+    matches: List[SessionRecord] = []
+    for rec in records:
+        candidates = [
+            rec.session_id.lower(),
+            rec.path.stem.lower(),
+            rec.path.name.lower(),
+        ]
+        if any(candidate == needle or candidate.startswith(needle) or needle in candidate for candidate in candidates):
+            matches.append(rec)
+    return matches
+
+def print_session_details(rec: SessionRecord):
+    title = get_session_preview_title(rec.path)
+    try:
+        size_label = format_size(rec.path.stat().st_size)
+    except OSError:
+        size_label = "?"
+    dt_str = datetime.fromtimestamp(rec.mtime).strftime("%Y-%m-%d %H:%M")
+
+    print(f"\n  {Style.BOLD}SESSION FOUND{Style.RESET}")
+    print(f"  {Style.DIM}{'━' * 62}{Style.RESET}")
+    print(f"  {Style.BOLD}Title:{Style.RESET}      {title}")
+    print(f"  {Style.BOLD}Session ID:{Style.RESET} {rec.session_id}")
+    print(f"  {Style.BOLD}Project:{Style.RESET}    {rec.pname}")
+    print(f"  {Style.BOLD}Workspace:{Style.RESET}  {rec.cwd or '(unknown)'}")
+    print(f"  {Style.BOLD}Date:{Style.RESET}       {dt_str}")
+    print(f"  {Style.BOLD}Size:{Style.RESET}       {size_label}")
+    print(f"  {Style.BOLD}File:{Style.RESET}       {rec.path}")
+    print(f"  {Style.DIM}{'━' * 62}{Style.RESET}")
+
+def find_session_by_id_flow(records: List[SessionRecord]):
+    _clear_screen()
+    print(f"\n  {Style.BOLD}{Style.HEADER}FIND SESSION BY ID{Style.RESET}\n")
+    print(f"  {Style.DIM}Paste the full session ID, rollout file name, or a long ID prefix.{Style.RESET}")
+    query = input(f"\n  {Style.BOLD}Session ID > {Style.RESET}").strip()
+    if not query:
+        return
+    matches = find_records_by_session_id(records, query)
+
+    if not matches:
+        print(f"\n  {Style.warn('No matching session found. Use at least 6 characters from the session ID.')}")
+        input(f"\n{Style.DIM}Press Enter to return to menu...{Style.RESET}")
+        return
+
+    if len(matches) == 1:
+        rec = matches[0]
+        print_session_details(rec)
+        if prompt_yes_no("Export this session now?", default=True):
+            convert_files([rec.path])
+        return
+
+    print(f"\n  {Style.BOLD}{len(matches)} matches found{Style.RESET}  {Style.DIM}(showing newest first){Style.RESET}\n")
+    matches = sorted(matches, key=lambda r: r.mtime, reverse=True)
+    shown = matches[:SESSIONS_PER_PAGE]
+    render_session_table(shown, start_no=1, global_latest=records[0].path if records else None, show_project=True)
+    if len(matches) > len(shown):
+        print(f"  {Style.DIM}Narrow the ID to see the remaining {len(matches) - len(shown)} matches.{Style.RESET}")
+    choice = input(f"\n  {Style.BOLD}Select a session number to export, or Enter to cancel > {Style.RESET}").strip()
+    if not choice:
+        return
+    selected = _parse_row_selection(choice, [r.path for r in shown])
+    if selected:
+        convert_files(selected)
+    else:
+        input(f"\n{Style.DIM}Press Enter to return to menu...{Style.RESET}")
 
 
 def interactive_loop():
@@ -1772,6 +2127,7 @@ def interactive_loop():
             print(f"\n{Style.BOLD}OPTIONS:{Style.RESET}  {Style.DIM}(single keypress; type a number to select){Style.RESET}")
             print(f"  {Style.GREEN}[#, #]{Style.RESET}      Convert sessions on this page (e.g. '1, 3')")
             print(f"  {Style.YELLOW}[a]{Style.RESET}         Convert all sessions on this page")
+            print(f"  {Style.YELLOW}[s]{Style.RESET}         Find a session by ID")
             print(f"  {Style.CYAN}[←/→]{Style.RESET} or {Style.CYAN}[n/p]{Style.RESET}  Next / previous page")
             print(f"  {Style.BLUE}[m]{Style.RESET}         Switch to PROJECT view")
             print(f"  {Style.RED}[q]{Style.RESET}         Quit")
@@ -1781,6 +2137,8 @@ def interactive_loop():
                 print("Bye."); sys.exit(0)
             elif action == 'cmd' and value == 'M':
                 screen = 'project_list'; page = 0
+            elif action == 'cmd' and value == 'S':
+                find_session_by_id_flow(records)
             elif action == 'next':
                 if page < total_pages - 1:
                     page += 1
@@ -1815,6 +2173,7 @@ def interactive_loop():
 
             print(f"\n{Style.BOLD}OPTIONS:{Style.RESET}  {Style.DIM}(single keypress; type a number to open){Style.RESET}")
             print(f"  {Style.GREEN}[#]{Style.RESET}         Open a project to view its sessions")
+            print(f"  {Style.YELLOW}[s]{Style.RESET}         Find a session by ID")
             print(f"  {Style.CYAN}[←/→]{Style.RESET} or {Style.CYAN}[n/p]{Style.RESET}  Next / previous page")
             print(f"  {Style.BLUE}[m]{Style.RESET}         Switch to ALL-SESSIONS view")
             print(f"  {Style.RED}[q]{Style.RESET}         Quit")
@@ -1824,6 +2183,8 @@ def interactive_loop():
                 print("Bye."); sys.exit(0)
             elif action == 'cmd' and value == 'M':
                 screen = 'all'; page = 0
+            elif action == 'cmd' and value == 'S':
+                find_session_by_id_flow(records)
             elif action == 'next':
                 if page < total_pages - 1:
                     page += 1
@@ -1865,6 +2226,7 @@ def interactive_loop():
             print(f"\n{Style.BOLD}OPTIONS:{Style.RESET}  {Style.DIM}(single keypress; type a number to select){Style.RESET}")
             print(f"  {Style.GREEN}[#, #]{Style.RESET}      Convert sessions on this page (e.g. '1, 3')")
             print(f"  {Style.YELLOW}[a]{Style.RESET}         Convert all sessions on this page")
+            print(f"  {Style.YELLOW}[s]{Style.RESET}         Find a session by ID")
             print(f"  {Style.CYAN}[←/→]{Style.RESET} or {Style.CYAN}[n/p]{Style.RESET}  Next / previous page")
             print(f"  {Style.BLUE}[b]{Style.RESET}         Back to project list")
             print(f"  {Style.RED}[q]{Style.RESET}         Quit")
@@ -1876,6 +2238,8 @@ def interactive_loop():
                 screen = 'project_list'; page = 0; cur_project = None
             elif action == 'cmd' and value == 'M':
                 screen = 'all'; page = 0; cur_project = None
+            elif action == 'cmd' and value == 'S':
+                find_session_by_id_flow(records)
             elif action == 'next':
                 if page < total_pages - 1:
                     page += 1

@@ -4,6 +4,3 @@ __pycache__/
 
 # Backups & scratch
 *.bak
-
-# Local release helper — contains a personal access token, never commit
-create_release.py
