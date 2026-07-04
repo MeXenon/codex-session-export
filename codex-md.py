@@ -68,6 +68,10 @@ SESSIONS_DIR = CODEX_PATH / "sessions"
 SESSION_INDEX_PATH = CODEX_PATH / "session_index.jsonl"
 USER_MESSAGE_BEGIN = "## My request for Codex:"
 INTERACTIVE_SESSION_SOURCES = {"cli", "vscode", "atlas", "chatgpt"}
+ROLLOUT_ID_RE = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+    re.IGNORECASE,
+)
 
 # ──────────────────────────────────────────────────────────────
 # Section Definitions  (key, display_name, emoji, default_on)
@@ -235,8 +239,22 @@ def is_title_noise(line: str) -> bool:
     return False
 
 def extract_title_from_content(content: str) -> str:
-    title = extract_first_user_line(content)
-    return title or "Empty or Technical Session"
+    message = strip_user_message_prefix(content)
+    if not message:
+        return "Empty or Technical Session"
+
+    fallback = ""
+    for line in message.splitlines():
+        candidate = line.strip()
+        if not candidate:
+            continue
+        normalized = normalize_title_candidate(candidate)
+        noisy = is_title_noise(candidate)
+        if not fallback and not noisy:
+            fallback = normalized
+        if not noisy:
+            return normalized
+    return fallback or "Empty or Technical Session"
 
 def format_size(num_bytes: int) -> str:
     units = ("B", "KB", "MB", "GB", "TB")
@@ -276,6 +294,83 @@ def load_thread_names() -> Dict[str, str]:
 
 THREAD_NAMES = load_thread_names()
 
+def _text_from_message_content(content) -> str:
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get('text')
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(part, str):
+                parts.append(part)
+        return '\n'.join(parts).strip()
+    if isinstance(content, str):
+        return content.strip()
+    if content is None:
+        return ""
+    return str(content).strip()
+
+def _message_text_from_entry(entry: Dict, role_name: str) -> str:
+    payload = entry.get('payload', {})
+    if not isinstance(payload, dict):
+        return ""
+
+    etype = entry.get('type')
+    ptype = payload.get('type')
+    if etype == 'event_msg' and ptype == f'{role_name}_message':
+        return _text_from_message_content(payload.get('message', ''))
+    if etype == 'response_item' and ptype == 'message' and payload.get('role') == role_name:
+        return _text_from_message_content(payload.get('content', []))
+    return ""
+
+def _rollout_session_id(path: Path) -> Optional[str]:
+    matches = ROLLOUT_ID_RE.findall(path.stem)
+    return matches[-1] if matches else None
+
+def _nested_subagent_parent_id(source) -> Optional[str]:
+    if not isinstance(source, dict):
+        return None
+    subagent = source.get('subagent')
+    if not isinstance(subagent, dict):
+        return None
+    spawn = subagent.get('thread_spawn')
+    if not isinstance(spawn, dict):
+        return None
+    parent = spawn.get('parent_thread_id')
+    return parent if isinstance(parent, str) else None
+
+def session_aliases_from_meta(path: Path, meta: Optional[Dict]) -> Set[str]:
+    aliases: Set[str] = set()
+
+    def add(value):
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                aliases.add(value)
+
+    if isinstance(meta, dict):
+        for key in ('id', 'session_id', 'parent_thread_id', 'thread_id'):
+            add(meta.get(key))
+        add(_nested_subagent_parent_id(meta.get('source')))
+
+    add(_rollout_session_id(path))
+    return aliases
+
+def primary_session_id(path: Path, meta: Optional[Dict], aliases: Optional[Set[str]] = None) -> str:
+    if isinstance(meta, dict):
+        for key in ('id', 'session_id', 'parent_thread_id', 'thread_id'):
+            value = meta.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    rollout_id = _rollout_session_id(path)
+    if rollout_id:
+        return rollout_id
+    if aliases:
+        return sorted(aliases)[0]
+    stem = path.stem
+    return stem[len("rollout-"):] if stem.startswith("rollout-") else stem
+
 # ──────────────────────────────────────────────────────────────
 # Session Scanning  (fast head-scan for preview list)
 # ──────────────────────────────────────────────────────────────
@@ -284,10 +379,10 @@ def read_session_summary(filepath: Path, head_limit=10, user_scan_limit=200):
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as fp:
             session_meta = None
             first_user_message = None
-            saw_user_event = False
+            saw_user_message = False
             lines_scanned = 0
             while lines_scanned < head_limit or (
-                session_meta is not None and not saw_user_event
+                session_meta is not None and not saw_user_message
                 and lines_scanned < head_limit + user_scan_limit
             ):
                 line = fp.readline()
@@ -302,36 +397,49 @@ def read_session_summary(filepath: Path, head_limit=10, user_scan_limit=200):
                 if entry.get('type') == 'session_meta' and session_meta is None:
                     session_meta = entry.get('payload', {})
                     continue
-                if (entry.get('type') == 'event_msg'
-                        and entry.get('payload', {}).get('type') == 'user_message'):
-                    saw_user_event = True
+                message = _message_text_from_entry(entry, 'user')
+                if message:
+                    saw_user_message = True
                     if first_user_message is None:
-                        message = strip_user_message_prefix(entry['payload'].get('message', ''))
+                        message = strip_user_message_prefix(message)
                         if message:
                             first_user_message = message
                     if session_meta is not None:
                         break
-            return session_meta, first_user_message, saw_user_event
+            return session_meta, first_user_message, saw_user_message
     except Exception:
         return None, None, False
 
 def is_interactive_session_meta(meta: Optional[Dict]) -> bool:
     if not meta: return False
     source = meta.get('source')
-    if not isinstance(source, str): return False
-    return source.lower() in INTERACTIVE_SESSION_SOURCES
+    if isinstance(source, str) and source.lower() in INTERACTIVE_SESSION_SOURCES:
+        return True
+    if _nested_subagent_parent_id(source):
+        return True
+    thread_source = meta.get('thread_source')
+    if isinstance(thread_source, str) and thread_source.lower() in ('user', 'subagent'):
+        return True
+    originator = meta.get('originator')
+    return isinstance(originator, str) and originator.lower().startswith('codex')
 
 def get_session_preview_title(filepath: Path) -> str:
-    meta, first_user_message, saw_user_event = read_session_summary(filepath)
-    if not is_interactive_session_meta(meta) or not saw_user_event:
+    meta, first_user_message, saw_user_message = read_session_summary(filepath)
+    if not isinstance(meta, dict):
         return "Untitled / System Log"
-    thread_id = meta.get('id') if isinstance(meta.get('id'), str) else None
-    if thread_id and thread_id in THREAD_NAMES:
-        return normalize_title_candidate(THREAD_NAMES[thread_id])
+    for thread_id in session_aliases_from_meta(filepath, meta):
+        if thread_id in THREAD_NAMES:
+            return normalize_title_candidate(THREAD_NAMES[thread_id])
     if not first_user_message:
-        return "[Image]"
-    title = extract_first_user_line(first_user_message)
-    return title or "Untitled / System Log"
+        if saw_user_message:
+            return "[Image]"
+        sid = primary_session_id(filepath, meta)
+        return f"System Session {sid[:8]}" if sid else "Untitled / System Log"
+    title = extract_title_from_content(first_user_message)
+    if title == "Empty or Technical Session":
+        sid = primary_session_id(filepath, meta)
+        return f"System Session {sid[:8]}" if sid else "Untitled / System Log"
+    return title
 
 # ──────────────────────────────────────────────────────────────
 # Session Parser  (full parse of a .jsonl file)
@@ -346,6 +454,16 @@ class SessionParser:
         self.latest_input_tokens = 0
         self.model_context_window = 0
         self._load()
+
+    def _append_dialog_message(self, msg_type: str, ts: str, content: str):
+        content = _text_from_message_content(content)
+        if not content:
+            return
+        if self.data:
+            last = self.data[-1]
+            if last.get('type') == msg_type and last.get('content') == content:
+                return
+        self.data.append({'type': msg_type, 'timestamp': ts, 'content': content})
 
     # --- loading ---
     def _load(self):
@@ -399,8 +517,7 @@ class SessionParser:
         # 2 ─ User message  (event_msg wrapper)
         if etype == 'event_msg' and ptype == 'user_message':
             msg = payload.get('message', '')
-            if msg:
-                self.data.append({'type': 'user_message', 'timestamp': ts, 'content': msg})
+            self._append_dialog_message('user_message', ts, msg)
             return
 
         # 3 ─ Agent reasoning  (event_msg wrapper)
@@ -413,8 +530,7 @@ class SessionParser:
         # 4 ─ Agent message  (event_msg wrapper)
         if etype == 'event_msg' and ptype == 'agent_message':
             msg = payload.get('message', '')
-            if msg:
-                self.data.append({'type': 'agent_message', 'timestamp': ts, 'content': msg})
+            self._append_dialog_message('agent_message', ts, msg)
             return
 
         # 5 ─ Token count & rate limits
@@ -589,17 +705,17 @@ class SessionParser:
 
             # 10h ─ Developer / system messages
             if ptype == 'message' and role == 'developer':
-                parts = payload.get('content', [])
-                if isinstance(parts, list):
-                    text = '\n'.join(p.get('text', '') for p in parts if p.get('type') == 'input_text')
-                else:
-                    text = str(parts)
+                text = _text_from_message_content(payload.get('content', []))
                 if text:
                     self.data.append({'type': 'system_message', 'timestamp': ts, 'content': text})
                 return
 
-            # 10i ─ response_item message (assistant / user raw) — skip, covered by event_msg
-            if ptype == 'message' and role in ('assistant', 'user'):
+            # 10i ─ Raw assistant / user messages. Some logs have no event_msg mirror.
+            if ptype == 'message' and role == 'assistant':
+                self._append_dialog_message('agent_message', ts, payload.get('content', []))
+                return
+            if ptype == 'message' and role == 'user':
+                self._append_dialog_message('user_message', ts, payload.get('content', []))
                 return
 
         # Everything else is silently ignored.
@@ -898,6 +1014,8 @@ def read_key() -> str:
             return 'ENTER'
         if ch == ' ':
             return 'SPACE'
+        if ch in ('\b', '\x7f'):
+            return 'BACKSPACE'
         if ch == '\x03':
             raise KeyboardInterrupt
         if ch == '\xe0' or ch == '\x00':  # special key prefix on Windows
@@ -920,6 +1038,8 @@ def read_key() -> str:
                 return 'ENTER'
             if ch == ' ':
                 return 'SPACE'
+            if ch in ('\x7f', '\b'):
+                return 'BACKSPACE'
             if ch == '\x03':
                 raise KeyboardInterrupt
             return ch.upper()
@@ -1375,24 +1495,29 @@ def project_display_name(cwd: Optional[str]) -> str:
 # ──────────────────────────────────────────────────────────────
 class SessionRecord:
     """Lightweight metadata for one session, captured during the scan."""
-    __slots__ = ('path', 'mtime', 'cwd', 'pkey', 'pname', 'session_id')
+    __slots__ = ('path', 'mtime', 'cwd', 'pkey', 'pname', 'session_id', 'aliases', 'has_user_message')
 
-    def __init__(self, path: Path, mtime: float, cwd: Optional[str], session_id: Optional[str] = None):
+    def __init__(self, path: Path, mtime: float, cwd: Optional[str],
+                 session_id: Optional[str] = None, aliases: Optional[Set[str]] = None,
+                 has_user_message: bool = False):
         self.path = path
         self.mtime = mtime
         self.cwd = cwd or ""
         self.pkey = project_key_from_cwd(cwd)
         self.pname = project_display_name(cwd)
         self.session_id = session_id or path.stem.replace("rollout-", "")
+        self.aliases = set(aliases or set())
+        self.aliases.add(self.session_id)
+        self.has_user_message = has_user_message
 
 
 def scan_sessions() -> List[SessionRecord]:
-    """Scan the sessions directory once, returning interactive sessions
+    """Scan the sessions directory once, returning session records
     (newest first) with their project (cwd) captured.
 
-    This replaces the old get_all_sessions(): it does the same filtering but
-    also records each session's project so the caller can group/paginate
-    without re-reading every file."""
+    Records are intentionally not limited to event_msg-backed interactive
+    sessions because Codex can store valid user/agent content as response_item
+    entries, and subagent sessions can use object-shaped source metadata."""
     if not SESSIONS_DIR.exists():
         return []
     pattern = str(SESSIONS_DIR / "**" / "rollout-*.jsonl")
@@ -1400,15 +1525,17 @@ def scan_sessions() -> List[SessionRecord]:
     records: List[SessionRecord] = []
     for f in files:
         path = Path(f)
-        meta, _, saw_user_event = read_session_summary(path)
-        if is_interactive_session_meta(meta) and saw_user_event:
-            cwd = meta.get('cwd') if isinstance(meta, dict) else None
-            session_id = meta.get('id') if isinstance(meta.get('id'), str) else None
-            try:
-                mtime = path.stat().st_mtime
-            except OSError:
-                mtime = 0.0
-            records.append(SessionRecord(path, mtime, cwd, session_id))
+        meta, _, saw_user_message = read_session_summary(path)
+        if not isinstance(meta, dict) and not saw_user_message:
+            continue
+        cwd = meta.get('cwd') if isinstance(meta, dict) and isinstance(meta.get('cwd'), str) else None
+        aliases = session_aliases_from_meta(path, meta)
+        session_id = primary_session_id(path, meta, aliases)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        records.append(SessionRecord(path, mtime, cwd, session_id, aliases, saw_user_message))
     records.sort(key=lambda r: r.mtime, reverse=True)
     return records
 
@@ -1553,6 +1680,39 @@ def _parse_row_selection(choice: str, page_paths: List[Path]) -> List[Path]:
     return valid
 
 
+def _read_seeded_selection_line(seed: str) -> str:
+    """Read a browser selection line after the first digit was already pressed."""
+    buffer = list(seed)
+    sys.stdout.write(seed)
+    sys.stdout.flush()
+
+    while True:
+        key = read_key()
+        if key == 'ENTER':
+            print()
+            return ''.join(buffer).strip()
+        if key == 'ESC':
+            print()
+            return ""
+        if key == 'BACKSPACE':
+            if buffer:
+                buffer.pop()
+                sys.stdout.write('\b \b')
+                sys.stdout.flush()
+            continue
+        if key == 'SPACE':
+            buffer.append(' ')
+            sys.stdout.write(' ')
+            sys.stdout.flush()
+            continue
+        if key in ('LEFT', 'RIGHT', 'UP', 'DOWN'):
+            continue
+        if len(key) == 1 and key.isprintable():
+            buffer.append(key)
+            sys.stdout.write(key)
+            sys.stdout.flush()
+
+
 def _read_browser_action(prompt: str):
     """Render the prompt and read a single keypress for the browser.
 
@@ -1580,14 +1740,7 @@ def _read_browser_action(prompt: str):
         print()
         return ('next', None)
     if key and key.isdigit():
-        # Selection mode: echo the first digit, then read the rest of the line.
-        sys.stdout.write(key)
-        sys.stdout.flush()
-        try:
-            rest = input()
-        except EOFError:
-            rest = ''
-        return ('select', key + rest)
+        return ('select', _read_seeded_selection_line(key))
     if key in ('ENTER', 'SPACE', 'ESC', ''):
         print()
         return ('noop', None)
@@ -2004,21 +2157,59 @@ def convert_files(valid_files: List[Path]):
 
 SESSIONS_PER_PAGE = 12
 
+def _search_terms_for_session_query(query: str) -> Set[str]:
+    raw = query.strip().strip('"').strip("'").lower()
+    terms: Set[str] = set()
+    if not raw:
+        return terms
+
+    def add(value: str):
+        value = value.strip().lower()
+        if value:
+            terms.add(value)
+
+    add(raw)
+    leaf = re.split(r'[\\/]', raw)[-1]
+    add(leaf)
+    if leaf.endswith('.jsonl'):
+        leaf = leaf[:-6]
+        add(leaf)
+    if leaf.startswith("rollout-"):
+        add(leaf[len("rollout-"):])
+    for match in ROLLOUT_ID_RE.findall(raw):
+        add(match)
+    return {term for term in terms if len(term) >= 6}
+
 def find_records_by_session_id(records: List[SessionRecord], query: str) -> List[SessionRecord]:
-    needle = query.strip().strip('"').lower()
-    if needle.startswith("rollout-"):
-        needle = needle[len("rollout-"):]
-    if len(needle) < 6:
+    needles = _search_terms_for_session_query(query)
+    if not needles:
         return []
+
+    exact_ids = {needle for needle in needles if ROLLOUT_ID_RE.fullmatch(needle)}
+    if exact_ids:
+        primary_matches = [
+            rec for rec in records
+            if rec.session_id.lower() in exact_ids
+        ]
+        if primary_matches:
+            return primary_matches
 
     matches: List[SessionRecord] = []
     for rec in records:
-        candidates = [
+        stem = rec.path.stem.lower()
+        candidates = {alias.lower() for alias in rec.aliases}
+        candidates.update({
             rec.session_id.lower(),
-            rec.path.stem.lower(),
+            stem,
             rec.path.name.lower(),
-        ]
-        if any(candidate == needle or candidate.startswith(needle) or needle in candidate for candidate in candidates):
+            stem[len("rollout-"):] if stem.startswith("rollout-") else stem,
+            str(rec.path).lower(),
+        })
+        if any(
+            candidate == needle or candidate.startswith(needle) or needle in candidate
+            for needle in needles
+            for candidate in candidates
+        ):
             matches.append(rec)
     return matches
 
@@ -2034,6 +2225,12 @@ def print_session_details(rec: SessionRecord):
     print(f"  {Style.DIM}{'━' * 62}{Style.RESET}")
     print(f"  {Style.BOLD}Title:{Style.RESET}      {title}")
     print(f"  {Style.BOLD}Session ID:{Style.RESET} {rec.session_id}")
+    related = sorted(
+        alias for alias in rec.aliases
+        if alias != rec.session_id and ROLLOUT_ID_RE.fullmatch(alias)
+    )
+    if related:
+        print(f"  {Style.BOLD}Related IDs:{Style.RESET} {', '.join(related)}")
     print(f"  {Style.BOLD}Project:{Style.RESET}    {rec.pname}")
     print(f"  {Style.BOLD}Workspace:{Style.RESET}  {rec.cwd or '(unknown)'}")
     print(f"  {Style.BOLD}Date:{Style.RESET}       {dt_str}")
