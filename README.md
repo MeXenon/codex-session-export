@@ -2,7 +2,7 @@
   <img src="banner.png" alt="Codex Session Export Preview" width="100%" style="max-width: 800px; border-radius: 12px; margin-bottom: 20px;">
 </div>
 
-# Codex Session Export ⚡️
+# Codex (ChatGPT) Session Export ⚡️
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.x](https://img.shields.io/badge/python-3.x-blue.svg)](https://www.python.org/)
