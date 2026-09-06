@@ -36,6 +36,7 @@ Because it’s a pure Python CLI tool, it's completely **portable**. You can use
 
 ## ✨ Features
 
+- **Current Codex Tool Compatibility *(New in v2.6.4)*:** Terminal commands and outputs are recognized across legacy `function_call` rollouts, Code Mode `exec` wrappers, legacy `exec_command_end` events, and current `item_completed → CommandExecution` records. Code Mode MCP and other tool wrappers are also routed to their correct sections instead of being mislabeled as patches. Canonical command records automatically replace terminal wrapper fallbacks so exports stay complete without duplicates.
 - **Project View & Pagination *(New in v2.6)*:** Just like Codex Desktop, your sessions are now grouped by **project** (their working directory). Toggle between a flat **All Sessions** list and a **Projects** view with a single key, drill into any project to see only its threads, and page through large histories cleanly with `n`/`p` — no more giant unreadable walls of sessions.
 - **Find by Session ID:** Paste a full session ID, rollout filename, or long ID prefix to jump straight to the matching session and see its title, workspace, date, size, and source file before exporting.
 - **20 Filterable Sections:** Toggle everything from User/Agent messages to hidden agent reasoning, terminal commands, MCP tool calls, git snapshots, and more.

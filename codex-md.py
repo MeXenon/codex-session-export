@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Codex Session Manager & Markdown Converter  (v2.6.3)
+Codex Session Manager & Markdown Converter  (v2.6.4)
 -------------------------------------------------
 An interactive tool to browse, filter, and convert OpenAI Codex
 session logs (.jsonl) into readable Markdown documents.
@@ -20,6 +20,7 @@ import sys
 import json
 import glob
 import re
+import ast
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set
@@ -81,17 +82,135 @@ ROLLOUT_ID_RE = re.compile(
 # ──────────────────────────────────────────────────────────────
 # Function name → sub-category mapping
 # Built from scanning 223 session files (21 unique function names)
-TERMINAL_FUNCS = {'exec_command', 'shell', 'shell_command', 'write_stdin', 'send_input'}
+TERMINAL_FUNCS = {'exec_command', 'execute_command', 'run_command', 'shell', 'shell_command', 'write_stdin', 'send_input'}
 OTHER_TOOL_FUNCS = {'spawn_agent', 'wait_agent', 'close_agent', 'update_plan',
                     'request_user_input', 'view_image', 'list_mcp_resources',
                     'read_mcp_resource', 'list_mcp_resource_templates'}
 
-def classify_tool(name: str) -> str:
+_CODE_MODE_TOOL_CALL_RE = re.compile(
+    r'\btools\.(?:exec_command|execute_command|run_command|shell|shell_command|write_stdin|send_input)\s*\('
+)
+_CODE_MODE_MCP_CALL_RE = re.compile(r'\btools\.(mcp__[A-Za-z0-9_]+)\s*\(')
+_CODE_MODE_ANY_TOOL_RE = re.compile(r'\btools\.([A-Za-z0-9_]+)\s*\(')
+_CODE_MODE_COMMAND_RE = re.compile(
+    r'''\b(?:cmd|command)\s*:\s*(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|`((?:\\.|[^`\\])*)`)''',
+    re.DOTALL,
+)
+
+def classify_tool(name: str, namespace: str = '') -> str:
     """Classify a function_call name into a sub-category key."""
     if name in TERMINAL_FUNCS:       return 'terminal_cmd'
     if name.startswith('mcp__'):     return 'mcp_tool'
     if name in OTHER_TOOL_FUNCS:     return 'other_tool'
-    return 'terminal_cmd'
+    if namespace:
+        return 'other_tool'
+    return 'other_tool'
+
+def _decode_code_mode_string(value: str, quote: str) -> str:
+    token = quote + value + quote
+    try:
+        if quote == '"':
+            return json.loads(token)
+        if quote == "'":
+            return ast.literal_eval(token)
+    except (ValueError, SyntaxError, json.JSONDecodeError):
+        pass
+    if quote == '`':
+        return value.replace(r'\`', '`').replace(r'\\', '\\')
+    return value
+
+def _extract_code_mode_commands(source: str) -> List[str]:
+    if not isinstance(source, str) or not _CODE_MODE_TOOL_CALL_RE.search(source):
+        return []
+    commands: List[str] = []
+    for match in _CODE_MODE_COMMAND_RE.finditer(source):
+        groups = match.groups()
+        for index, value in enumerate(groups):
+            if value is not None:
+                quote = ('"', "'", '`')[index]
+                decoded = _decode_code_mode_string(value, quote).strip()
+                if decoded and decoded not in commands:
+                    commands.append(decoded)
+                break
+    return commands
+
+def _is_code_mode_terminal_wrapper(name: str, source: str) -> bool:
+    return name == 'exec' and isinstance(source, str) and bool(_CODE_MODE_TOOL_CALL_RE.search(source))
+
+def _classify_code_mode_exec(source: str) -> Tuple[str, str]:
+    """Return (section category, display tool name) for a Code Mode exec wrapper."""
+    if not isinstance(source, str):
+        return 'other_tool', 'exec'
+    if _CODE_MODE_TOOL_CALL_RE.search(source):
+        return 'terminal_cmd', 'exec'
+    mcp_match = _CODE_MODE_MCP_CALL_RE.search(source)
+    if mcp_match:
+        return 'mcp_tool', mcp_match.group(1)
+    tool_match = _CODE_MODE_ANY_TOOL_RE.search(source)
+    if tool_match:
+        return 'other_tool', tool_match.group(1)
+    return 'other_tool', 'exec'
+
+def _normalize_tool_output(value) -> str:
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return ''.join(_normalize_tool_output(item) for item in value)
+    if isinstance(value, dict):
+        if isinstance(value.get('text'), str):
+            return value['text']
+        if 'output' in value:
+            return _normalize_tool_output(value.get('output'))
+        if 'content' in value:
+            return _normalize_tool_output(value.get('content'))
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+def _command_execution_command(item: Dict) -> str:
+    parsed = item.get('parsed_cmd')
+    if isinstance(parsed, list):
+        commands = [part.get('cmd', '').strip() for part in parsed
+                    if isinstance(part, dict) and isinstance(part.get('cmd'), str) and part.get('cmd', '').strip()]
+        if commands:
+            return ' ; '.join(commands)
+    command = item.get('command', '')
+    if isinstance(command, list):
+        parts = [str(part) for part in command]
+        for flag in ('-Command', '-c', '/c'):
+            if flag in parts:
+                index = parts.index(flag)
+                if index + 1 < len(parts):
+                    return parts[index + 1]
+        return ' '.join(parts)
+    return str(command or '')
+
+def _command_execution_output(item: Dict) -> str:
+    aggregated = item.get('aggregated_output')
+    if isinstance(aggregated, str) and aggregated:
+        return aggregated
+    formatted = item.get('formatted_output')
+    if isinstance(formatted, str) and formatted:
+        return formatted
+    stdout = _normalize_tool_output(item.get('stdout'))
+    stderr = _normalize_tool_output(item.get('stderr'))
+    return stdout + stderr
+
+def _normalized_command(value: str) -> str:
+    return re.sub(r'\s+', ' ', str(value or '')).strip().lower()
+
+def _commands_equivalent(left: str, right: str) -> bool:
+    left_n = _normalized_command(left)
+    right_n = _normalized_command(right)
+    if not left_n or not right_n:
+        return False
+    if left_n == right_n:
+        return True
+    return min(len(left_n), len(right_n)) >= 8 and (left_n in right_n or right_n in left_n)
 
 SECTION_DEFS = [
     ('user_message',       'User Messages',        '👤', True ),
@@ -453,6 +572,7 @@ class SessionParser:
         self.start_time = None
         self.latest_input_tokens = 0
         self.model_context_window = 0
+        self._call_id_map: Dict[str, str] = {}
         self._load()
 
     def _append_dialog_message(self, msg_type: str, ts: str, content: str):
@@ -479,6 +599,8 @@ class SessionParser:
                 except json.JSONDecodeError:
                     continue
 
+        self._dedupe_code_mode_terminal_fallbacks()
+
         # Derive title
         thread_id = self.metadata.get('id')
         title_found = False
@@ -495,6 +617,43 @@ class SessionParser:
                         break
         if not title_found and self.metadata.get('id'):
             self.title = f"System Session {self.metadata['id'][:8]}"
+
+    def _append_command_execution(self, ts: str, item: Dict):
+        command = _command_execution_command(item)
+        call_id = item.get('id') or item.get('call_id')
+        self.data.append({
+            'type': 'terminal_cmd', 'timestamp': ts,
+            'name': 'exec_command', 'arguments': command,
+            'call_id': call_id, '_canonical_terminal': True,
+        })
+        self.data.append({
+            'type': 'terminal_output', 'timestamp': ts,
+            'output': _command_execution_output(item),
+            'call_id': call_id, '_canonical_terminal': True,
+        })
+
+    def _dedupe_code_mode_terminal_fallbacks(self):
+        canonical_commands = [
+            str(item.get('arguments', '')) for item in self.data
+            if item.get('type') == 'terminal_cmd' and item.get('_canonical_terminal')
+        ]
+        if not canonical_commands:
+            return
+        redundant_call_ids: Set[str] = set()
+        for item in self.data:
+            if item.get('type') != 'terminal_cmd' or not item.get('_code_mode_fallback'):
+                continue
+            fallback_commands = item.get('_code_mode_commands') or [item.get('arguments', '')]
+            if any(_commands_equivalent(fallback, canonical)
+                   for fallback in fallback_commands for canonical in canonical_commands):
+                call_id = item.get('call_id')
+                if call_id:
+                    redundant_call_ids.add(call_id)
+        if redundant_call_ids:
+            self.data = [
+                item for item in self.data
+                if not (item.get('_code_mode_fallback') and item.get('call_id') in redundant_call_ids)
+            ]
 
     # --- entry processing (ALL 23 discovered patterns) ---
     def _process_entry(self, entry: Dict, line_num: int):
@@ -576,7 +735,19 @@ class SessionParser:
             })
             return
 
-        # 7 ─ Context compacted / thread rolled back / turn aborted / item completed
+        # 7 ─ Canonical current command execution record
+        if etype == 'event_msg' and ptype == 'item_completed':
+            idata = payload.get('item', {})
+            if isinstance(idata, dict) and idata.get('type') == 'CommandExecution':
+                self._append_command_execution(ts, idata)
+                return
+
+        # 7b ─ Legacy completed command event retained by Codex rollout migration
+        if etype == 'event_msg' and ptype == 'exec_command_end':
+            self._append_command_execution(ts, payload)
+            return
+
+        # 7c ─ Context compacted / thread rolled back / turn aborted / item completed
         if etype == 'event_msg' and ptype in ('context_compacted', 'thread_rolled_back', 'turn_aborted', 'item_completed'):
             detail = ''
             num_turns = 0
@@ -635,7 +806,7 @@ class SessionParser:
             # 10b ─ Function call  (classified by function name)
             if ptype == 'function_call':
                 fname = payload.get('name', '')
-                cat = classify_tool(fname)
+                cat = classify_tool(fname, payload.get('namespace', ''))
                 call_id = payload.get('call_id')
                 self.data.append({
                     'type': cat, 'timestamp': ts,
@@ -645,8 +816,6 @@ class SessionParser:
                     '_tool_cat': cat,  # save category for output matching
                 })
                 # Remember call_id → category for output pairing
-                if not hasattr(self, '_call_id_map'):
-                    self._call_id_map = {}
                 if call_id:
                     self._call_id_map[call_id] = cat
                 return
@@ -654,33 +823,58 @@ class SessionParser:
             # 10c ─ Function call output  (matched to its call's category)
             if ptype == 'function_call_output':
                 call_id = payload.get('call_id')
-                if not hasattr(self, '_call_id_map'):
-                    self._call_id_map = {}
-                parent_cat = self._call_id_map.get(call_id, 'terminal_cmd')
-                out_cat = TOOL_OUTPUT_MAP.get(parent_cat, 'terminal_output')
+                parent_cat = self._call_id_map.get(call_id, 'other_tool')
+                out_cat = TOOL_OUTPUT_MAP.get(parent_cat, 'other_tool_output')
                 self.data.append({
                     'type': out_cat, 'timestamp': ts,
-                    'output': payload.get('output', ''),
+                    'output': _normalize_tool_output(payload.get('output', '')),
                     'call_id': call_id,
                 })
                 return
 
-            # 10d ─ Custom tool call  (apply_patch, etc.)
+            # 10d ─ Code Mode exec wrapper, or a real custom tool (apply_patch, etc.)
             if ptype == 'custom_tool_call':
+                name = payload.get('name', 'custom_tool')
+                source = payload.get('input', '')
+                call_id = payload.get('call_id')
+                if name == 'exec':
+                    cat, display_name = _classify_code_mode_exec(source)
+                    commands = _extract_code_mode_commands(source) if cat == 'terminal_cmd' else []
+                    arguments = commands[0] if len(commands) == 1 else ({'commands': commands} if commands else source)
+                    self.data.append({
+                        'type': cat, 'timestamp': ts,
+                        'name': display_name, 'arguments': arguments,
+                        'call_id': call_id,
+                        '_code_mode_fallback': cat == 'terminal_cmd',
+                        '_code_mode_commands': commands,
+                    })
+                    if call_id:
+                        self._call_id_map[call_id] = cat
+                    return
                 self.data.append({
                     'type': 'custom_tool_call', 'timestamp': ts,
-                    'name': payload.get('name', 'custom_tool'),
-                    'content': payload.get('input', ''),
-                    'call_id': payload.get('call_id'),
+                    'name': name,
+                    'content': source,
+                    'call_id': call_id,
                 })
                 return
 
             # 10e ─ Custom tool output
             if ptype == 'custom_tool_call_output':
+                call_id = payload.get('call_id')
+                output = _normalize_tool_output(payload.get('output', ''))
+                parent_cat = self._call_id_map.get(call_id)
+                if parent_cat in TOOL_OUTPUT_MAP:
+                    self.data.append({
+                        'type': TOOL_OUTPUT_MAP[parent_cat], 'timestamp': ts,
+                        'output': output, 'call_id': call_id,
+                        '_code_mode_fallback': parent_cat == 'terminal_cmd',
+                    })
+                    return
                 self.data.append({
                     'type': 'custom_tool_output', 'timestamp': ts,
-                    'content': payload.get('output', ''),
-                    'call_id': payload.get('call_id'),
+                    'content': output,
+                    'call_id': call_id,
                 })
                 return
 
