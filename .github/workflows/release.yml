@@ -19,7 +19,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Publish newest pending tag
+      - name: Publish or update newest tagged release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -35,67 +35,36 @@ jobs:
           git rev-parse "${tag}^{commit}" >/dev/null
 
           if [[ "${tag}" == "v2.6.4" ]]; then
-            cat > /tmp/release-notes.md <<'EOF'
+            notes_file="$(mktemp)"
+            cat >"${notes_file}" <<'EOF'
           ## What's new
 
-          This release restores reliable tool-event export after recent Codex rollout-format changes, while preserving compatibility with older session logs.
-
-          ### Fixed
-
-          - **Current Codex terminal events:** Added support for `item_completed → CommandExecution`, including command, working directory, status, exit code, and terminal output.
-          - **Code Mode terminal calls:** Detects terminal commands wrapped inside `custom_tool_call(name="exec")` and correctly pairs their outputs.
-          - **Legacy compatibility:** Keeps support for direct `function_call` / `function_call_output` terminal records and legacy `exec_command_end` events.
-          - **Duplicate suppression:** When a canonical `CommandExecution` record exists, wrapper fallbacks are removed so the same terminal command/output is not exported twice.
-          - **Tool classification:** Code Mode MCP calls now go to **MCP Calls/Outputs**, non-terminal tools go to **Other Tools/Outputs**, and real custom tools such as patches remain under **Patches**.
-          - **Safer unknown-tool handling:** Unknown function calls no longer default to terminal commands.
-          - **Output normalization:** Handles string, array, and structured object outputs from newer Codex rollouts without rendering Python-style dictionary noise.
-
-          ### Compatibility tested
-
-          - Legacy Codex rollout format
-          - Intermediate Code Mode `exec` wrapper format
-          - Current `CommandExecution` format
-          - Legacy `exec_command_end`
-          - MCP and non-terminal Code Mode wrappers
-          - Real custom patch calls
-
-          ### Verification
-
-          - **8/8 regression tests passed**
-          - Real legacy session: **34/34 terminal commands and outputs detected**
-          - Real Code Mode session: **11/11 terminal commands and outputs detected**
-          - Real current session: **2/2 terminal commands and outputs detected**
-          - Full September sample scan: **28 session files parsed successfully**
-
-          ### Upgrade note
-
-          No migration or configuration change is required. Replace/update `codex-md.py` and use it normally; existing older session logs remain supported.
+          - Restored terminal command and output detection for newer Codex session formats.
+          - Added support for current `CommandExecution` records while keeping older Codex session logs compatible.
+          - Added Code Mode support so terminal activity wrapped through `exec` is exported correctly.
+          - Prevented duplicate terminal entries when both wrapper and canonical execution records are present.
+          - Improved tool classification so MCP calls and other Code Mode tools are exported to the correct sections instead of appearing as patches.
+          - Improved tool-output parsing for newer structured output formats.
           EOF
-          fi
 
-          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            if [[ -f /tmp/release-notes.md ]]; then
+            if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
               gh release edit "${tag}" \
                 --repo "${GITHUB_REPOSITORY}" \
                 --title "${tag}" \
-                --notes-file /tmp/release-notes.md
-              echo "Updated release notes for ${tag}."
+                --notes-file "${notes_file}"
             else
-              echo "Release ${tag} already exists."
+              gh release create "${tag}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --verify-tag \
+                --title "${tag}" \
+                --notes-file "${notes_file}"
             fi
-            exit 0
-          fi
-
-          if [[ -f /tmp/release-notes.md ]]; then
-            gh release create "${tag}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --verify-tag \
-              --title "${tag}" \
-              --notes-file /tmp/release-notes.md
-          else
+          elif ! gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release create "${tag}" \
               --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \
               --generate-notes \
               --title "${tag}"
+          else
+            echo "Release ${tag} already exists."
           fi
