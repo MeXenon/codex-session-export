@@ -2617,6 +2617,7 @@ def interactive_loop():
             print(f"\n{Style.BOLD}OPTIONS:{Style.RESET}  {Style.DIM}(single keypress; type a number to select){Style.RESET}")
             print(f"  {Style.GREEN}[#, #]{Style.RESET}      Convert sessions on this page (e.g. '1, 3')")
             print(f"  {Style.YELLOW}[a]{Style.RESET}         Convert all sessions on this page")
+            print(f"  {Style.YELLOW}[e]{Style.RESET}         Convert all {total} sessions in this project")
             print(f"  {Style.YELLOW}[s]{Style.RESET}         Find a session by ID")
             print(f"  {Style.CYAN}[←/→]{Style.RESET} or {Style.CYAN}[n/p]{Style.RESET}  Next / previous page")
             print(f"  {Style.BLUE}[b]{Style.RESET}         Back to project list")
@@ -2642,6 +2643,11 @@ def interactive_loop():
                     confirm = input(f"{Style.warn(f'Convert all {len(page_paths)} sessions on this page? (y/n): ')}")
                     if confirm.strip().lower() == 'y':
                         convert_files(page_paths)
+            elif action == 'cmd' and value == 'E':
+                project_paths = [record.path for record in proj_recs]
+                confirm = input(f"{Style.warn(f'Convert all {len(project_paths)} sessions in this project? (y/n): ')}")
+                if confirm.strip().lower() == 'y':
+                    convert_files(project_paths)
             elif action == 'select':
                 sel = _parse_row_selection(value, page_paths)
                 if sel:

@@ -98,6 +98,7 @@ python codex-md.py
    * `←` / `→` (or `↑` / `↓`, or `n` / `p`) — previous / next page.
    * **Type a number** — convert the session(s) on the **current page** (e.g. `1`, or `1, 3, 5`; numbers are page-local, press Enter to confirm). In the **Projects** view a number instead opens that project.
    * `a` — convert every session shown on the current page.
+   * `e` — while viewing a project, convert every session in that project, including sessions on other pages.
    * `s` — find a session by session ID, rollout filename, or long ID prefix.
    * `m` — toggle between **All Sessions** and **Projects** views.
    * `b` — back to the project list (when you're inside a project).
