@@ -36,12 +36,14 @@ Because it’s a pure Python CLI tool, it's completely **portable**. You can use
 
 ## ✨ Features
 
+- **Paginated Codex History:** Resolves `history_base` references across rollout files, including completed same-thread history recorded in Codex's local history projection. Pages of the same session appear as one browser entry. Missing or inconsistent base history produces an error instead of a partial export.
+- **Task Turn Counting:** Uses task lifecycle records to count turns; AGENTS instructions and environment context remain exportable without inflating the turn count. Older logs without task records use user prompts as turn boundaries.
 - **Current Codex Tool Compatibility *(Updated in v2.6.5)*:** Terminal, patch, MCP, and other tool activity is normalized across legacy calls, mixed Code Mode `exec` wrappers, current canonical `CommandExecution` / `FileChange` / `McpToolCall` records, and newer Responses tool-item families. Mixed wrappers no longer hide patches or MCP calls, canonical records replace successful fallbacks without duplicates, and failed patch attempts remain visible.
 - **Project View & Pagination *(New in v2.6)*:** Just like Codex Desktop, your sessions are now grouped by **project** (their working directory). Toggle between a flat **All Sessions** list and a **Projects** view with a single key, drill into any project to see only its threads, and page through large histories cleanly with `n`/`p` — no more giant unreadable walls of sessions.
 - **Find by Session ID:** Paste a full session ID, rollout filename, or long ID prefix to jump straight to the matching session and see its title, workspace, date, size, and source file before exporting.
 - **20 Filterable Sections:** Toggle everything from User/Agent messages to hidden agent reasoning, terminal commands, MCP tool calls, git snapshots, and more.
 - **Parallel Exports:** Select and process multiple sessions at the same time. The filter will show you the combined line counts and will export them simultaneously in one batch.
-- **Dynamic Output Capping:** Terminal payloads can be hundreds of thousands of lines long. Instantly cap output blocks to exactly 1, 5, 8, 10, or up to 500 lines to keep your context windows lean.
+- **Dynamic Output Capping:** Tool outputs are unlimited by default. Instantly cap output blocks to exactly 1, 5, 8, 10, or up to 500 lines to keep your context windows lean. System messages are exported in full.
 - **Granular Message Filtering:** Independently control how many of the last N blocks you want from each message type — 👤 User, 🤖 Agent, 🧠 Agent Reasoning, and 🔒 Internal Reasoning — all separately adjustable with `◀`/`▶`. Each defaults to showing all, so you only cut what you need.
 - **Last N Turns *(New in v2.4)*:** Don't need the full session? Select only the most recent N turns to export. A "turn" is one user message plus all the agent work that followed (reasoning, tool calls, outputs, responses). Perfect for extracting just the last few interactions without wading through the entire history.
 - **Live Context *(New in v2.5)*:** Want to see *exactly* what the LLM is seeing right now? The "Live Context" option parses the raw JSON logs to reverse-engineer Codex's memory state. It dynamically tracks the model's exact context limit (e.g. 258k), displays real-time token usage, resolves all your `Undo`/`Rollback` actions, and processes session compactions so you export the strict active memory window.
@@ -115,6 +117,7 @@ python codex-md.py
    * `◀` / `▶` on **🧠 Agent Reasoning Cap** - Keep only the last N agent reasoning blocks
    * `◀` / `▶` on **🔒 Internal Reasoning Cap** - Keep only the last N internal reasoning blocks
    * `1`-`7` - Load presets
+   * `A` or preset `7` (**Full Export**) - Enable every section, disable Clean Chat, and reset every output/message cap to **ALL**.
 4. **Export Destination:** Press `Q` when you're ready, and you will be asked where to send the output:
    * **[F]ile:** Save directly to a `.md` file.
    * **[C]lipboard:** Instantly copy the raw Markdown so you can paste it straight into ChatGPT or Claude.
@@ -144,3 +147,11 @@ When pushing AI to its limits, the conversation log becomes your most valuable c
 *Note: In previous versions, selecting 'Full Session' could sometimes cause the program to crash on very large JSON logs. This has been fully resolved.*
 
 *If this tool saved your context window (or your sanity), **please give it a ⭐️!***
+
+## Local verification
+
+Run the parser and export regression tests from the project directory:
+
+```bash
+python -B -m unittest -v test_codex_md
+```
