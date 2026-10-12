@@ -21,6 +21,7 @@ import json
 import glob
 import re
 import ast
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set
@@ -670,6 +671,124 @@ def load_thread_names() -> Dict[str, str]:
 
 THREAD_NAMES = load_thread_names()
 
+def _codex_home_for_rollout(path: Path) -> Path:
+    for parent in path.parents:
+        if parent.name in ('sessions', 'archived_sessions'):
+            return parent.parent
+    return CODEX_PATH
+
+def _read_rollout_entries(path: Path, limit=None) -> List[Dict]:
+    """Read a rollout, optionally stopping at an exclusive ordinal/byte boundary."""
+    entries = []
+    ordinal = offset = 0
+    with path.open('rb') as fp:
+        if limit is not None:
+            # Forks inherit the parent's ordinals, while byte offsets start at
+            # zero in each new rollout. Read the local ordinal origin first.
+            try:
+                header = json.loads(fp.readline().decode('utf-8', errors='replace'))
+                base = header.get('payload', {}).get('history_base')
+                if header.get('type') == 'session_meta' and isinstance(base, dict):
+                    ordinal = base.get('end_ordinal_exclusive', 0)
+            except json.JSONDecodeError:
+                pass
+            fp.seek(0)
+        for line in fp:
+            if limit is not None and offset >= limit[1]:
+                break
+            ordinal += 1
+            offset += len(line)
+            try:
+                entries.append(json.loads(line.decode('utf-8', errors='replace')))
+            except json.JSONDecodeError:
+                continue
+    if limit is not None and (ordinal, offset) != limit:
+        raise ValueError(
+            f"History boundary does not match {path.name}: "
+            f"expected ordinal/bytes {limit}, got {(ordinal, offset)}"
+        )
+    return entries
+
+def _history_projection_limit(home: Path, thread_id: str):
+    database = home / 'thread_history_1.sqlite'
+    if not database.exists():
+        return None
+    try:
+        connection = sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)
+        try:
+            row = connection.execute(
+                'SELECT next_rollout_ordinal, next_rollout_byte_offset '
+                'FROM thread_history_projection_state WHERE thread_id = ?',
+                (thread_id,),
+            ).fetchone()
+            return tuple(row) if row else None
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return None
+
+def load_rollout_history(path: Path, seen=None, limit=None):
+    """Resolve paginated history before parsing or applying an export scope."""
+    seen = set() if seen is None else seen
+    resolved = path.resolve()
+    if resolved in seen:
+        raise ValueError(f"Circular history reference: {path.name}")
+    seen.add(resolved)
+    entries = _read_rollout_entries(path, limit)
+    meta = next((r.get('payload', {}) for r in entries if r.get('type') == 'session_meta'), {})
+    history_base = meta.get('history_base')
+    if not isinstance(history_base, dict):
+        return entries, [path]
+
+    thread_id = history_base.get('thread_id')
+    if not isinstance(thread_id, str) or not ROLLOUT_ID_RE.fullmatch(thread_id):
+        raise ValueError(f"Invalid history_base thread ID in {path.name}")
+    boundary = (history_base.get('end_ordinal_exclusive'), history_base.get('end_byte_offset'))
+    if not all(isinstance(value, int) and value >= 0 for value in boundary):
+        raise ValueError(f"Invalid history_base boundary in {path.name}")
+    home = _codex_home_for_rollout(path)
+    candidates = []
+    for folder in ('sessions', 'archived_sessions'):
+        for candidate in (home / folder).rglob(f'*{thread_id}*.jsonl'):
+            if candidate.resolve() in seen:
+                continue
+            candidate_meta, _, _ = read_session_summary(candidate)
+            if not candidate_meta or candidate_meta.get('id') != thread_id:
+                continue
+            timestamp = candidate_meta.get('timestamp', '')
+            if timestamp >= meta.get('timestamp', ''):
+                continue
+            candidates.append((timestamp, candidate))
+    if not candidates:
+        raise ValueError(f"Missing base history for {path.name} (thread {thread_id})")
+
+    # Same-thread continuations can follow turns projected after the checkpoint.
+    # Forks retain their explicit checkpoint instead.
+    projection = _history_projection_limit(home, thread_id) if meta.get('id') == thread_id else None
+    failures = []
+    for _, candidate in sorted(candidates, reverse=True):
+        selected_limit = boundary
+        if projection and projection[0] >= boundary[0] and projection[1] >= boundary[1]:
+            try:
+                projected = _read_rollout_entries(candidate, projection)
+                if all(r.get('timestamp', '') <= meta.get('timestamp', '') for r in projected):
+                    selected_limit = projection
+            except ValueError:
+                pass
+        try:
+            base_entries, sources = load_rollout_history(candidate, seen.copy(), selected_limit)
+        except ValueError as error:
+            failures.append(str(error))
+            continue
+        return base_entries + entries, sources + [path]
+    raise ValueError(f"Cannot resolve history boundary for {path.name}\n" + '\n'.join(failures))
+
+def _is_context_message(text: str) -> bool:
+    return text.lstrip().startswith((
+        '# AGENTS.md instructions for ', '<environment_context>',
+        '<external_codex_apps_open_page>',
+    ))
+
 def _text_from_message_content(content) -> str:
     if isinstance(content, list):
         parts: List[str] = []
@@ -829,6 +948,8 @@ class SessionParser:
         self.start_time = None
         self.latest_input_tokens = 0
         self.model_context_window = 0
+        self.source_paths = [filepath]
+        self._inside_task = False
         self._call_id_map: Dict[str, str] = {}
         self._call_meta_map: Dict[str, Dict] = {}
         self._code_mode_call_map: Dict[str, List[Dict]] = {}
@@ -843,21 +964,19 @@ class SessionParser:
             last = self.data[-1]
             if last.get('type') == msg_type and last.get('content') == content:
                 return
-        self.data.append({'type': msg_type, 'timestamp': ts, 'content': content})
+        self.data.append({
+            'type': msg_type, 'timestamp': ts, 'content': content,
+            '_turn_start': msg_type == 'user_message' and not self._inside_task
+                           and not _is_context_message(content),
+        })
 
     # --- loading ---
     def _load(self):
         if not self.filepath.exists():
             return
-        with open(self.filepath, 'r', encoding='utf-8', errors='replace') as f:
-            for line_num, line in enumerate(f):
-                line = line.strip()
-                if not line: continue
-                try:
-                    entry = json.loads(line)
-                    self._process_entry(entry, line_num)
-                except json.JSONDecodeError:
-                    continue
+        entries, self.source_paths = load_rollout_history(self.filepath)
+        for line_num, entry in enumerate(entries):
+            self._process_entry(entry, line_num)
 
         self._dedupe_code_mode_terminal_fallbacks()
         self._dedupe_patch_fallbacks()
@@ -1130,6 +1249,7 @@ class SessionParser:
 
         # 6 ─ Task lifecycle
         if etype == 'event_msg' and ptype in ('task_started', 'task_complete'):
+            self._inside_task = ptype == 'task_started'
             detail = ''
             if ptype == 'task_started':
                 model = payload.get('collaboration_mode_kind', '')
@@ -1141,6 +1261,7 @@ class SessionParser:
             self.data.append({
                 'type': 'task_event', 'timestamp': ts,
                 'event': ptype,
+                '_turn_start': ptype == 'task_started',
                 'content': ptype.replace('_', ' ').title() + detail,
             })
             return
@@ -1172,6 +1293,8 @@ class SessionParser:
 
         # 7c ─ Context compacted / thread rolled back / turn aborted / item completed
         if etype == 'event_msg' and ptype in ('context_compacted', 'thread_rolled_back', 'turn_aborted', 'item_completed'):
+            if ptype in ('thread_rolled_back', 'turn_aborted'):
+                self._inside_task = False
             detail = ''
             num_turns = 0
             if ptype == 'thread_rolled_back':
@@ -1552,16 +1675,16 @@ class SessionParser:
 
     # --- turn boundaries ---
     def get_turn_boundaries(self) -> List[int]:
-        """Return indices in self.data where each turn starts (at each user_message)."""
-        return [i for i, item in enumerate(self.data) if item['type'] == 'user_message']
+        """Use task starts when available; otherwise use actual user prompts."""
+        return [i for i, item in enumerate(self.data) if item.get('_turn_start')]
 
     def get_turn_count(self) -> int:
-        """Return the number of turns (user messages) in this session."""
+        """Return the number of user task turns in this session."""
         return len(self.get_turn_boundaries())
 
     def trim_to_last_n_turns(self, n: int):
         """Keep only the last N turns worth of data items.
-        A turn starts at a user_message and includes everything until the next one."""
+        A turn includes its task start, context, user prompt, and agent work."""
         if n <= 0:
             return
         boundaries = self.get_turn_boundaries()
@@ -1581,7 +1704,7 @@ class SessionParser:
             if item['type'] == 'session_event' and item.get('event') == 'thread_rolled_back':
                 num_turns = item.get('num_turns', 0)
                 if num_turns > 0:
-                    user_msg_indices = [i for i, x in enumerate(live_data) if x['type'] == 'user_message']
+                    user_msg_indices = [i for i, x in enumerate(live_data) if x.get('_turn_start')]
                     if user_msg_indices:
                         cut_idx = user_msg_indices[-num_turns] if num_turns <= len(user_msg_indices) else 0
                         live_data = live_data[:cut_idx]
@@ -1600,32 +1723,17 @@ class SessionParser:
         self.data = live_data
 
     def _parse_replacement_history(self, repl_history) -> List[Dict]:
-        parsed = []
-        for repl_item in repl_history:
-            ptype = repl_item.get('type', '')
-            role = repl_item.get('role', '')
-            content = repl_item.get('content', [])
-            
-            # Helper to extract text from content array or string
-            def extract_text(c):
-                if isinstance(c, list):
-                    return '\n'.join(p.get('text', '') for p in c if p.get('type') == 'input_text')
-                return str(c)
-
-            if ptype == 'message' and role == 'user':
-                msg = extract_text(content)
-                if msg: parsed.append({'type': 'user_message', 'timestamp': '', 'content': msg})
-            elif ptype == 'message' and role == 'assistant':
-                msg = extract_text(content)
-                if msg: parsed.append({'type': 'agent_message', 'timestamp': '', 'content': msg})
-            elif ptype == 'message' and role == 'developer':
-                msg = extract_text(content)
-                if msg: parsed.append({'type': 'system_message', 'timestamp': '', 'content': msg})
-            elif ptype == 'reasoning':
-                parts = repl_item.get('summary', [])
-                summary = '\n'.join(p.get('text', '') for p in parts if p.get('text', ''))
-                parsed.append({'type': 'reasoning', 'timestamp': '', 'content': summary, 'encrypted': bool(repl_item.get('encrypted_content'))})
-        return parsed
+        parser = SessionParser.__new__(SessionParser)
+        parser.data = []
+        parser.start_time = None
+        parser._inside_task = False
+        parser._call_id_map = {}
+        parser._call_meta_map = {}
+        parser._code_mode_call_map = {}
+        parser._canonical_dynamic_output_ids = set()
+        for index, item in enumerate(repl_history):
+            parser._process_entry({'type': 'response_item', 'timestamp': '', 'payload': item}, index)
+        return parser.data
 
     # --- markdown rendering with filter ---
     def to_markdown(self, section_filter: Optional[Dict[str, bool]] = None,
@@ -1669,6 +1777,10 @@ class SessionParser:
         if section_filter.get('session_meta', False) and self.metadata:
             md.append("```yaml")
             md.append(f"Source: {self.filepath.name}")
+            if len(self.source_paths) > 1:
+                md.append('History Sources:')
+                for source in self.source_paths[:-1]:
+                    md.append(f"  - {source.name}")
             if self.start_time:
                 md.append(f"Date: {self.start_time}")
             if self.metadata.get('cwd'):
@@ -1759,11 +1871,7 @@ class SessionParser:
                 md.append(f"> 📌 **{content}**\n")
 
             elif itype == 'system_message':
-                # Truncate very long system prompts
-                display = content[:800]
-                if len(content) > 800:
-                    display += f"\n... ({len(content) - 800} chars truncated)"
-                md.append(f"### ⚙️ System Message\n\n```text\n{display}\n```\n")
+                md.append(f"### ⚙️ System Message\n\n```text\n{content}\n```\n")
 
             elif itype == 'git_snapshot':
                 md.append(f"> 📸 **Git Snapshot:** {content}\n")
@@ -1926,8 +2034,8 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
     fstate: Dict[str, bool] = {s[0]: s[3] for s in SECTION_DEFS}
     clean_content = False
     
-    output_cap = 8
-    cap_idx = CAP_STEPS.index(8)
+    output_cap = 0
+    cap_idx = 0
     
     user_cap = 0
     u_idx = 0
@@ -2156,6 +2264,9 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
                     internal_cap = MSG_CAP_STEPS[i_idx]
             elif key == 'A':
                 for s in SECTION_DEFS: fstate[s[0]] = True
+                clean_content = False
+                output_cap = user_cap = agent_cap = reason_cap = internal_cap = 0
+                cap_idx = u_idx = a_idx = r_idx = i_idx = 0
             elif key == 'N':
                 for s in SECTION_DEFS: fstate[s[0]] = False
             elif key == 'I':
@@ -2163,8 +2274,8 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
             elif key == 'D':
                 for s in SECTION_DEFS: fstate[s[0]] = s[3]
                 clean_content = False
-                output_cap = 8
-                cap_idx = CAP_STEPS.index(8)
+                output_cap = 0
+                cap_idx = 0
                 user_cap = 0
                 u_idx = 0
                 agent_cap = 0
@@ -2184,6 +2295,9 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
                     else:
                         for s in SECTION_DEFS: fstate[s[0]] = s[0] in pkeys
                     clean_content = pclean
+                    if _pname == 'Full Export':
+                        output_cap = user_cap = agent_cap = reason_cap = internal_cap = 0
+                        cap_idx = u_idx = a_idx = r_idx = i_idx = 0
     finally:
         # Restore cursor and leave the alt screen. The terminal pops back to
         # whatever was on the main screen before we entered.
@@ -2297,7 +2411,7 @@ def scan_sessions() -> List[SessionRecord]:
         return []
     pattern = str(SESSIONS_DIR / "**" / "rollout-*.jsonl")
     files = glob.glob(pattern, recursive=True)
-    records: List[SessionRecord] = []
+    by_session: Dict[str, Tuple[str, SessionRecord]] = {}
     for f in files:
         path = Path(f)
         meta, _, saw_user_message = read_session_summary(path)
@@ -2310,7 +2424,20 @@ def scan_sessions() -> List[SessionRecord]:
             mtime = path.stat().st_mtime
         except OSError:
             mtime = 0.0
-        records.append(SessionRecord(path, mtime, cwd, session_id, aliases, saw_user_message))
+        record = SessionRecord(path, mtime, cwd, session_id, aliases, saw_user_message)
+        timestamp = meta.get('timestamp', '') if isinstance(meta, dict) else ''
+        previous = by_session.get(session_id)
+        if previous:
+            previous_timestamp, previous_record = previous
+            aliases = previous_record.aliases | record.aliases
+            if (timestamp, mtime) > (previous_timestamp, previous_record.mtime):
+                record.aliases = aliases
+                by_session[session_id] = (timestamp, record)
+            else:
+                previous_record.aliases = aliases
+        else:
+            by_session[session_id] = (timestamp, record)
+    records = [record for _, record in by_session.values()]
     records.sort(key=lambda r: r.mtime, reverse=True)
     return records
 
@@ -2807,12 +2934,16 @@ def convert_files(valid_files: List[Path]):
     # Parse all selected sessions
     print(f"\n{Style.info('Parsing selected session(s)...')}")
     parsers: List[SessionParser] = []
+    failed = False
     for f in valid_files:
         try:
             parsers.append(SessionParser(f))
         except Exception as e:
+            failed = True
             print(Style.error(f"Failed to parse {f.name}: {e}"))
 
+    if failed:
+        input(f"\n{Style.DIM}Press Enter to continue...{Style.RESET}")
     if not parsers:
         return
 
