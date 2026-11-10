@@ -878,7 +878,7 @@ class SessionParser:
                         title_found = True
                         break
         if not title_found and self.metadata.get('id'):
-            self.title = f"System Session {self.metadata['id'][:8]}"
+            self.title = f"System Session {str(self.metadata['id'])[:8]}"
 
     def _append_command_execution(self, ts: str, item: Dict):
         command = _command_execution_command(item)
