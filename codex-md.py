@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Codex Session Manager & Markdown Converter  (v2.6.5)
+Codex Session Manager & Markdown Converter  (v2.7.0)
 -------------------------------------------------
 An interactive tool to browse, filter, and convert OpenAI Codex
 session logs (.jsonl) into readable Markdown documents.
@@ -22,6 +22,7 @@ import glob
 import re
 import ast
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set
@@ -646,6 +647,115 @@ def format_size(num_bytes: int) -> str:
     return f"{size:.1f}{unit}"
 
 # ──────────────────────────────────────────────────────────────
+# Compressed Session Logs  (rollout-*.jsonl.zst)
+#
+# Codex can store a rollout log as a Zstandard-compressed file.  The helpers
+# below decompress such logs while they are read, so no decompressed copy is
+# written to disk.
+# ──────────────────────────────────────────────────────────────
+ZST_SUFFIX = '.zst'
+
+
+class SessionReadError(RuntimeError):
+    """A session log could not be read."""
+
+
+def is_compressed_session_path(path) -> bool:
+    """True when the path points at a Zstandard-compressed session log."""
+    return str(path).lower().endswith(ZST_SUFFIX)
+
+
+def session_log_stem(path) -> str:
+    """Rollout stem without the compression suffix ('rollout-<ts>-<uuid>')."""
+    name = os.path.basename(str(path))
+    if name.lower().endswith(ZST_SUFFIX):
+        name = name[:-len(ZST_SUFFIX)]
+    return os.path.splitext(name)[0]
+
+
+def rollout_identity_key(path) -> str:
+    """Key identifying the rollout a file belongs to.
+
+    'rollout-x.jsonl' and 'rollout-x.jsonl.zst' in the same folder describe
+    the same rollout, so the compression suffix is ignored.  Files in
+    different folders stay separate.
+    """
+    name = os.path.basename(str(path))
+    if name.lower().endswith(ZST_SUFFIX):
+        name = name[:-len(ZST_SUFFIX)]
+    folder = os.path.dirname(str(path))
+    return os.path.normcase(os.path.join(folder, name))
+
+
+def load_zstd_backend():
+    """Return the available Zstandard module, or None.
+
+    Python 3.14+ ships 'compression.zstd'; older interpreters can use the
+    optional 'backports.zstd' package.  Both expose the same API:
+    zstd.open(path, mode='rt', encoding=..., errors=...) plus ZstdError.
+    Nothing is installed automatically.
+    """
+    try:
+        from compression import zstd
+        return zstd
+    except ImportError:
+        pass
+    try:
+        from backports import zstd
+        return zstd
+    except ImportError:
+        return None
+
+
+@contextmanager
+def open_session_text(filepath, errors: str = 'replace'):
+    """Open a session log as UTF-8 text, decompressing .zst files on the fly.
+
+    Plain .jsonl files are opened directly.  Compressed logs are streamed
+    through a Zstandard decompressor, so no decompressed copy is written to
+    disk.  A log that cannot be decompressed raises SessionReadError.
+    """
+    if not is_compressed_session_path(filepath):
+        with open(filepath, 'r', encoding='utf-8', errors=errors) as fp:
+            yield fp
+        return
+
+    zstd = load_zstd_backend()
+    if zstd is None:
+        raise SessionReadError(
+            f"No Zstandard decompressor available for '{os.path.basename(str(filepath))}'. "
+            "Use Python 3.14+ (compression.zstd) or install the optional "
+            "'backports.zstd' package (python -m pip install backports.zstd)."
+        )
+    try:
+        with zstd.open(filepath, mode='rt', encoding='utf-8', errors=errors) as fp:
+            yield fp
+    except (zstd.ZstdError, EOFError) as exc:
+        raise SessionReadError(
+            f"Failed to decompress '{os.path.basename(str(filepath))}': {exc}"
+        ) from exc
+
+
+def preferred_session_paths(paths: List[Path]) -> List[Path]:
+    """Drop compressed duplicates, keeping the plain copy of each rollout."""
+    plain_by_key: Dict[str, Path] = {}
+    for path in paths:
+        if not is_compressed_session_path(path):
+            plain_by_key.setdefault(rollout_identity_key(path), path)
+
+    preferred: List[Path] = []
+    seen = set()
+    for path in paths:
+        key = rollout_identity_key(path)
+        if key in seen:
+            continue
+        if is_compressed_session_path(path) and key in plain_by_key:
+            continue
+        seen.add(key)
+        preferred.append(path)
+    return preferred
+
+# ──────────────────────────────────────────────────────────────
 # Thread / Session Index
 # ──────────────────────────────────────────────────────────────
 def load_thread_names() -> Dict[str, str]:
@@ -677,23 +787,40 @@ def _codex_home_for_rollout(path: Path) -> Path:
             return parent.parent
     return CODEX_PATH
 
+@contextmanager
+def open_session_bytes(filepath):
+    """Stream decompressed bytes so history checkpoints use real UTF-8 byte offsets."""
+    if not is_compressed_session_path(filepath):
+        with open(filepath, 'rb') as fp:
+            yield fp
+        return
+    zstd = load_zstd_backend()
+    if zstd is None:
+        raise SessionReadError(
+            f"No Zstandard decompressor available for '{Path(filepath).name}'. "
+            "Use Python 3.14+ or install backports.zstd."
+        )
+    try:
+        with zstd.open(filepath, mode='rb') as fp:
+            yield fp
+    except (zstd.ZstdError, EOFError) as exc:
+        raise SessionReadError(f"Failed to decompress '{Path(filepath).name}': {exc}") from exc
+
+
 def _read_rollout_entries(path: Path, limit=None) -> List[Dict]:
-    """Read a rollout, optionally stopping at an exclusive ordinal/byte boundary."""
+    """Read an entire rollout or a checkpointed prefix in *decompressed bytes*."""
     entries = []
     ordinal = offset = 0
-    with path.open('rb') as fp:
-        if limit is not None:
-            # Forks inherit the parent's ordinals, while byte offsets start at
-            # zero in each new rollout. Read the local ordinal origin first.
-            try:
-                header = json.loads(fp.readline().decode('utf-8', errors='replace'))
-                base = header.get('payload', {}).get('history_base')
-                if header.get('type') == 'session_meta' and isinstance(base, dict):
-                    ordinal = base.get('end_ordinal_exclusive', 0)
-            except json.JSONDecodeError:
-                pass
-            fp.seek(0)
-        for line in fp:
+    with open_session_bytes(path) as fp:
+        for line_num, line in enumerate(fp):
+            if line_num == 0 and limit is not None:
+                try:
+                    header = json.loads(line.decode('utf-8', errors='replace'))
+                    base = header.get('payload', {}).get('history_base')
+                    if header.get('type') == 'session_meta' and isinstance(base, dict):
+                        ordinal = base.get('end_ordinal_exclusive', 0)
+                except (ValueError, AttributeError):
+                    pass
             if limit is not None and offset >= limit[1]:
                 break
             ordinal += 1
@@ -749,10 +876,16 @@ def load_rollout_history(path: Path, seen=None, limit=None):
     home = _codex_home_for_rollout(path)
     candidates = []
     for folder in ('sessions', 'archived_sessions'):
-        for candidate in (home / folder).rglob(f'*{thread_id}*.jsonl'):
+        folder_path = home / folder
+        matching = list(folder_path.rglob(f'*{thread_id}*.jsonl'))
+        matching += list(folder_path.rglob(f'*{thread_id}*.jsonl.zst'))
+        for candidate in preferred_session_paths(matching):
             if candidate.resolve() in seen:
                 continue
-            candidate_meta, _, _ = read_session_summary(candidate)
+            try:
+                candidate_meta, _, _ = read_session_summary(candidate)
+            except SessionReadError:
+                continue
             if not candidate_meta or candidate_meta.get('id') != thread_id:
                 continue
             timestamp = candidate_meta.get('timestamp', '')
@@ -820,7 +953,7 @@ def _message_text_from_entry(entry: Dict, role_name: str) -> str:
     return ""
 
 def _rollout_session_id(path: Path) -> Optional[str]:
-    matches = ROLLOUT_ID_RE.findall(path.stem)
+    matches = ROLLOUT_ID_RE.findall(session_log_stem(path))
     return matches[-1] if matches else None
 
 def _nested_subagent_parent_id(source) -> Optional[str]:
@@ -863,15 +996,20 @@ def primary_session_id(path: Path, meta: Optional[Dict], aliases: Optional[Set[s
         return rollout_id
     if aliases:
         return sorted(aliases)[0]
-    stem = path.stem
+    stem = session_log_stem(path)
     return stem[len("rollout-"):] if stem.startswith("rollout-") else stem
 
 # ──────────────────────────────────────────────────────────────
 # Session Scanning  (fast head-scan for preview list)
 # ──────────────────────────────────────────────────────────────
 def read_session_summary(filepath: Path, head_limit=10, user_scan_limit=200):
+    """Return (session_meta, first_user_message, saw_user_message).
+
+    A compressed log that cannot be read raises SessionReadError.  Plain logs
+    keep the historical behaviour of returning an empty summary.
+    """
     try:
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as fp:
+        with open_session_text(filepath, errors='ignore') as fp:
             session_meta = None
             first_user_message = None
             saw_user_message = False
@@ -902,6 +1040,8 @@ def read_session_summary(filepath: Path, head_limit=10, user_scan_limit=200):
                     if session_meta is not None:
                         break
             return session_meta, first_user_message, saw_user_message
+    except SessionReadError:
+        raise
     except Exception:
         return None, None, False
 
@@ -919,7 +1059,11 @@ def is_interactive_session_meta(meta: Optional[Dict]) -> bool:
     return isinstance(originator, str) and originator.lower().startswith('codex')
 
 def get_session_preview_title(filepath: Path) -> str:
-    meta, first_user_message, saw_user_message = read_session_summary(filepath)
+    try:
+        meta, first_user_message, saw_user_message = read_session_summary(filepath)
+    except SessionReadError:
+        # The log may have become unreadable after the scan picked it up.
+        return "Unreadable / System Log"
     if not isinstance(meta, dict):
         return "Untitled / System Log"
     for thread_id in session_aliases_from_meta(filepath, meta):
@@ -2394,7 +2538,7 @@ class SessionRecord:
         self.cwd = cwd or ""
         self.pkey = project_key_from_cwd(cwd)
         self.pname = project_display_name(cwd)
-        self.session_id = session_id or path.stem.replace("rollout-", "")
+        self.session_id = session_id or session_log_stem(path).replace("rollout-", "")
         self.aliases = set(aliases or set())
         self.aliases.add(self.session_id)
         self.has_user_message = has_user_message
@@ -2404,17 +2548,28 @@ def scan_sessions() -> List[SessionRecord]:
     """Scan the sessions directory once, returning session records
     (newest first) with their project (cwd) captured.
 
+    Both plain (rollout-*.jsonl) and Zstandard-compressed
+    (rollout-*.jsonl.zst) logs are picked up.  A rollout that exists in both
+    forms is listed once, using the plain copy.
+
     Records are intentionally not limited to event_msg-backed interactive
     sessions because Codex can store valid user/agent content as response_item
     entries, and subagent sessions can use object-shaped source metadata."""
     if not SESSIONS_DIR.exists():
         return []
-    pattern = str(SESSIONS_DIR / "**" / "rollout-*.jsonl")
-    files = glob.glob(pattern, recursive=True)
-    by_session: Dict[str, Tuple[str, SessionRecord]] = {}
-    for f in files:
-        path = Path(f)
-        meta, _, saw_user_message = read_session_summary(path)
+    files: List[str] = []
+    files.extend(glob.glob(str(SESSIONS_DIR / "**" / "rollout-*.jsonl"), recursive=True))
+    files.extend(glob.glob(str(SESSIONS_DIR / "**" / "rollout-*.jsonl.zst"), recursive=True))
+    scanned: List[Tuple[SessionRecord, Dict, str]] = []
+    for path in preferred_session_paths([Path(f) for f in files]):
+        try:
+            meta, _, saw_user_message = read_session_summary(path)
+        except SessionReadError as exc:
+            try:
+                print(Style.warn(str(exc)))
+            except UnicodeEncodeError:
+                print(f"[warn] {str(exc).encode('ascii', 'replace').decode('ascii')}")
+            continue
         if not isinstance(meta, dict) and not saw_user_message:
             continue
         cwd = meta.get('cwd') if isinstance(meta, dict) and isinstance(meta.get('cwd'), str) else None
@@ -2426,18 +2581,41 @@ def scan_sessions() -> List[SessionRecord]:
             mtime = 0.0
         record = SessionRecord(path, mtime, cwd, session_id, aliases, saw_user_message)
         timestamp = meta.get('timestamp', '') if isinstance(meta, dict) else ''
-        previous = by_session.get(session_id)
-        if previous:
-            previous_timestamp, previous_record = previous
-            aliases = previous_record.aliases | record.aliases
-            if (timestamp, mtime) > (previous_timestamp, previous_record.mtime):
-                record.aliases = aliases
-                by_session[session_id] = (timestamp, record)
-            else:
-                previous_record.aliases = aliases
-        else:
-            by_session[session_id] = (timestamp, record)
-    records = [record for _, record in by_session.values()]
+        scanned.append((record, meta if isinstance(meta, dict) else {}, timestamp))
+
+    # Keep independent rollouts visible even if Codex reused a thread UUID.
+    # Collapse only proven same-thread history_base pages, not unrelated logs
+    # sharing an ID or forks branching from a different thread.
+    parent = list(range(len(scanned)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for index, (record, meta, timestamp) in enumerate(scanned):
+        base = meta.get('history_base')
+        if not isinstance(base, dict) or base.get('thread_id') != meta.get('id'):
+            continue
+        candidate_indices = [
+            j for j, (prior, prior_meta, prior_ts) in enumerate(scanned)
+            if j != index and prior_meta.get('id') == base['thread_id']
+            and prior_ts < timestamp
+        ]
+        if candidate_indices:
+            best = max(candidate_indices, key=lambda j: (scanned[j][2], scanned[j][0].mtime))
+            parent[find(index)] = find(best)
+
+    grouped = {}
+    for index, (record, meta, timestamp) in enumerate(scanned):
+        grouped.setdefault(find(index), []).append((record, timestamp))
+    records = []
+    for group in grouped.values():
+        representative, _ = max(group, key=lambda entry: (entry[1], entry[0].mtime))
+        for member, _ in group:
+            representative.aliases.update(member.aliases)
+        records.append(representative)
     records.sort(key=lambda r: r.mtime, reverse=True)
     return records
 
@@ -2467,7 +2645,7 @@ def group_by_project(records: List[SessionRecord]) -> List[Dict]:
 
 def print_menu_header():
     os.system('cls' if os.name == 'nt' else 'clear')
-    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.6.3{Style.RESET}")
+    print(f"\n{Style.BOLD}CODEX SESSION MANAGER{Style.RESET}  {Style.DIM}v2.7.0{Style.RESET}")
     print(f"{Style.DIM}Directory: {SESSIONS_DIR}{Style.RESET}")
     print(f"{Style.DIM}Default output: {script_directory()}{Style.RESET}\n")
 
@@ -2931,6 +3109,11 @@ def convert_files(valid_files: List[Path]):
     if not valid_files:
         return
 
+    # A rollout stored in both forms is exported once, using the plain copy.
+    valid_files = preferred_session_paths(valid_files)
+    if not valid_files:
+        return
+
     # Parse all selected sessions
     print(f"\n{Style.info('Parsing selected session(s)...')}")
     parsers: List[SessionParser] = []
@@ -3077,6 +3260,9 @@ def _search_terms_for_session_query(query: str) -> Set[str]:
     add(raw)
     leaf = re.split(r'[\\/]', raw)[-1]
     add(leaf)
+    if leaf.endswith('.zst'):
+        leaf = leaf[:-4]
+        add(leaf)
     if leaf.endswith('.jsonl'):
         leaf = leaf[:-6]
         add(leaf)
@@ -3102,7 +3288,7 @@ def find_records_by_session_id(records: List[SessionRecord], query: str) -> List
 
     matches: List[SessionRecord] = []
     for rec in records:
-        stem = rec.path.stem.lower()
+        stem = session_log_stem(rec.path).lower()
         candidates = {alias.lower() for alias in rec.aliases}
         candidates.update({
             rec.session_id.lower(),

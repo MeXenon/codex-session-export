@@ -36,7 +36,7 @@ Because it’s a pure Python CLI tool, it's completely **portable**. You can use
 
 ## ✨ Features
 
-- **Paginated Codex History:** Resolves `history_base` references across rollout files, including completed same-thread history recorded in Codex's local history projection. Pages of the same session appear as one browser entry. Missing or inconsistent base history produces an error instead of a partial export.
+- **Paginated Codex History (v2.7.0):** Resolves `history_base` references across rollout files, including completed same-thread history recorded in Codex's local history projection. Proven same-thread continuation pages appear as one browser entry; independent logs and forks remain separate. Missing or inconsistent base history produces an error instead of a partial export.
 - **Task Turn Counting:** Uses task lifecycle records to count turns; AGENTS instructions and environment context remain exportable without inflating the turn count. Older logs without task records use user prompts as turn boundaries.
 - **Current Codex Tool Compatibility *(Updated in v2.6.5)*:** Terminal, patch, MCP, and other tool activity is normalized across legacy calls, mixed Code Mode `exec` wrappers, current canonical `CommandExecution` / `FileChange` / `McpToolCall` records, and newer Responses tool-item families. Mixed wrappers no longer hide patches or MCP calls, canonical records replace successful fallbacks without duplicates, and failed patch attempts remain visible.
 - **Project View & Pagination *(New in v2.6)*:** Just like Codex Desktop, your sessions are now grouped by **project** (their working directory). Toggle between a flat **All Sessions** list and a **Projects** view with a single key, drill into any project to see only its threads, and page through large histories cleanly with `n`/`p` — no more giant unreadable walls of sessions.
@@ -52,12 +52,14 @@ Because it’s a pure Python CLI tool, it's completely **portable**. You can use
 - **Overwrite Protection:** If an output file already exists, choose overwrite, rename, or skip. Overwrite is the default.
 - **7 Built-in Presets:** Jump straight to "Chat Only", "Terminal Only", "Outputs Only", or "Full Export" with a single keystroke.
 - **Real-Time Context Math:** See exactly how many lines you are selecting *before* you export, complete with a live progress bar.
+- **Compressed Session Logs:** `rollout-*.jsonl.zst` files are discovered, previewed and exported alongside plain `.jsonl` logs. A rollout stored in both forms is listed and exported once, using the plain copy.
 
 ---
 
 ## 🛠 Usage
 
-No complex dependencies. Just download and run the script using Python.
+No complex dependencies. Just download and run the script using Python. The only
+optional dependency is for compressed session logs on Python < 3.14 (see below).
 
 ### 🚀 Quick Start (One-Liner)
 Run the software instantly without manually cloning the repo:
@@ -88,6 +90,36 @@ python3 codex-md.py
 **Windows:**
 ```cmd
 python codex-md.py
+```
+
+### 🗜 Compressed Session Logs
+
+Codex can keep a rollout log as a Zstandard-compressed file named
+`rollout-*.jsonl.zst`. Both `rollout-*.jsonl` and `rollout-*.jsonl.zst` files
+are discovered, previewed and exported. When the same rollout exists in both
+forms it is listed and exported once, using the plain copy. Compressed logs
+are decompressed while they are read, so no decompressed copy is written to
+disk; the parser still keeps the session records it extracts from the log.
+
+Decompression uses `compression.zstd` from the standard library, which needs
+**Python 3.14 or newer**. On older Python versions, install the optional
+`backports.zstd` package:
+
+```bash
+python -m pip install backports.zstd
+```
+
+Nothing is installed automatically. Without a decompressor, compressed logs are
+reported with an error that names the missing dependency instead of silently
+disappearing, and the remaining sessions stay usable.
+
+### 🧪 Tests
+
+The test suite generates synthetic session logs in temporary directories and
+never reads a real Codex session:
+
+```bash
+python -m unittest discover -v
 ```
 
 ### The Interface
