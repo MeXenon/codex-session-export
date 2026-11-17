@@ -1,0 +1,48 @@
+name: Publish GitHub release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install optional Zstandard backend
+        run: python -m pip install backports.zstd
+      - name: Verify tagged version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          grep -F "Converter  (v${version})" codex-md.py
+          python -m py_compile codex-md.py
+          python -m unittest discover -q
+      - name: Build portable release package
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+          tag = os.environ['GITHUB_REF_NAME']
+          with ZipFile(f'codex-session-export-{tag}.zip', 'w', ZIP_DEFLATED) as archive:
+              for name in ('codex-md.py', 'README.md', 'LICENSE'):
+                  archive.write(Path(name), name)
+          PY
+      - name: Publish GitHub release with downloadable assets
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          make_latest: true
+          files: |
+            codex-md.py
+            codex-session-export-${{ github.ref_name }}.zip
